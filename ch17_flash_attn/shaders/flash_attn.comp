@@ -1,0 +1,103 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// FlashAttention 融合 kernel：O = softmax(QK^T / sqrt(d)) · V
+//
+// 核心思想：不物化 N×N 的分数矩阵，而是分块加载 K/V tile，
+// 用 online softmax（安全 softmax + 运行最大值）边算边累加。
+//
+// 每个工作组处理 1 个 query 行（Br = 1）。
+// 工作组内 32 线程（1 个 subgroup），每个线程负责 d/32 个输出维度的累加。
+// K/V tile 大小 Bc = 32。
+//
+// 论文：FlashAttention: Fast and Memory-Efficient Exact Attention
+//       with IO-Awareness (Dao et al., NeurIPS 2022)
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer QBuf { float Q[]; };  // N × d
+layout(std430, binding = 1) readonly buffer KBuf { float K[]; };  // N × d
+layout(std430, binding = 2) readonly buffer VBuf { float V[]; };  // N × d
+layout(std430, binding = 3) writeonly buffer OBuf { float O[]; }; // N × d
+
+layout(push_constant) uniform PC {
+    uint N;   // 序列长度
+    uint d;   // 头维度
+    uint Br;  // Q tile 大小（本实现固定为 1）
+    uint Bc;  // K/V tile 大小（本实现固定为 32）
+};
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;      // 0..31
+    uint q_idx = gl_WorkGroupID.x;          // 当前 query 行
+
+    if (q_idx >= N) return;
+
+    // ---- 每个线程负责的输出维范围 ----
+    // 32 个线程平分 d 维，每个线程处理 elemsPerThread 个元素
+    uint elemsPerThread = (d + 31u) / 32u;
+    uint colBase = tid * elemsPerThread;
+
+    // 加载 Q[q_idx] 中本线程负责的元素
+    float q_reg[4]; // 最多支持 d=128 (128/32=4)
+    for (uint i = 0u; i < elemsPerThread; ++i) {
+        uint col = colBase + i;
+        q_reg[i] = (col < d) ? Q[q_idx * d + col] : 0.0f;
+    }
+
+    // ---- Online softmax 状态 ----
+    float m = -1e30f;       // 运行最大值
+    float d_sum = 0.0f;     // 运行 exp 和（分母）
+    float o_acc[4];         // 输出累加器
+    for (uint i = 0u; i < elemsPerThread; ++i) o_acc[i] = 0.0f;
+
+    float inv_sqrt_d = inversesqrt(float(d));
+    uint num_tiles = (N + 31u) / 32u;   // Bc = 32
+
+    // ---- 主循环：遍历 K/V tile ----
+    for (uint t = 0u; t < num_tiles; ++t) {
+        uint k_start = t * 32u;
+
+        // 对 tile 内的每个 key 位置做 online softmax 更新
+        for (uint r = 0u; r < 32u; ++r) {
+            uint k_idx = k_start + r;
+            if (k_idx >= N) break;
+
+            // 计算 score = Q[q_idx] · K[k_idx] / sqrt(d)
+            // 每个线程贡献部分点积，subgroupAdd 归约得到完整分数
+            float partial = 0.0f;
+            for (uint i = 0u; i < elemsPerThread; ++i) {
+                uint col = colBase + i;
+                if (col < d)
+                    partial += q_reg[i] * K[k_idx * d + col];
+            }
+            float score = subgroupAdd(partial) * inv_sqrt_d;
+
+            // ---- Online softmax 更新 ----
+            float m_new = max(m, score);
+            // m_new 在所有线程中一致，因为 score 是 subgroupAdd 广播的
+
+            float rescale = exp(m - m_new);  // 重缩放因子（≤1）
+            float p = exp(score - m_new);    // exp(score - m_new)
+
+            // 更新分母：d_sum = d_sum * rescale + p
+            d_sum = d_sum * rescale + p;
+            // 所有线程的 d_sum 一致（都从同一状态出发）
+
+            // 更新输出：o_acc = o_acc * rescale + p * V[k_idx]
+            for (uint i = 0u; i < elemsPerThread; ++i) {
+                uint col = colBase + i;
+                if (col < d)
+                    o_acc[i] = o_acc[i] * rescale + p * V[k_idx * d + col];
+            }
+
+            m = m_new;
+        }
+    }
+
+    // ---- 最终归一化：O = O / d_sum ----
+    for (uint i = 0u; i < elemsPerThread; ++i) {
+        uint col = colBase + i;
+        if (col < d)
+            O[q_idx * d + col] = o_acc[i] / d_sum;
+    }
+}

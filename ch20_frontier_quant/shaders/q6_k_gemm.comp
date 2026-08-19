@@ -1,0 +1,186 @@
+#version 450
+// Q6_K 融合反量化 GEMM: C[M,N] = A[M,K] * W_q6_k[K,N] + bias[N]
+//
+// Q6_K 格式（简化版，基于 ggml K-quant 思想）：
+//   - Super-block: 256 个元素，分成 16 个 sub-block（各 16 元素）
+//   - 每个 sub-block 共享一个 6-bit scale
+//   - 6-bit 有符号值（范围 [-32, 31]），4 个值打包在 3 字节中
+//   - 反量化：w = val * (d * scale)
+//
+// 6-bit 值打包（4 个值 v0, v1, v2, v3 占 3 字节）：
+//   byte[0] = (v1 << 6) | v0           // 低 6 位 v0 + 高 2 位 v1
+//   byte[1] = (v2 << 4) | (v1 >> 2)    // 低 4 位 v1 + 高 4 位 v2
+//   byte[2] = (v3 << 2) | (v2 >> 4)    // 低 2 位 v2 + 高 6 位 v3
+//
+// 每个 super-block 的布局（53 × uint32 = 212 字节）：
+//   uint[0]    : low 16 bits = fp16 d (super-block scale)
+//                high 16 bits = fp16 dmin (super-block minimum)
+//   uint[1..4] : 16 × uint8 scales (6-bit scale per sub-block)
+//   uint[5..52] : 192 字节 packed 6-bit 数据
+//
+// 绑定：
+//   0: A (float)       — M×K 激活矩阵
+//   1: W_q6_k (uint)   — K×N 量化权重矩阵
+//   2: Bias (float)    — N 维偏置
+//   3: C (float)       — M×N 输出矩阵
+//
+// Push constants: { M, N, K, hasBias }
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer A     { float a[]; };
+layout(std430, binding = 1) readonly buffer Wq    { uint wq[]; };
+layout(std430, binding = 2) readonly buffer Bias  { float bias[]; };
+layout(std430, binding = 3) writeonly buffer C    { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint hasBias;
+};
+
+// Q6_K super-block 常量
+const uint Q6K_SUPER_BLOCK = 256u;
+const uint Q6K_SUB_BLOCK   = 16u;
+const uint Q6K_NUM_SUBS    = 16u;
+const uint Q6K_BLOCK_UINTS = 53u;
+
+// fp16 -> fp32 转换
+float fp16_to_fp32(uint bits) {
+    uint s = (bits >> 15u) & 0x1u;
+    uint e = (bits >> 10u) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(m), -24);
+    } else if (e == 31u) {
+        return (m == 0u) ? (s != 0u ? -1.0/0.0 : 1.0/0.0) : 0.0/0.0;
+    } else {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(0x400u | m), int(e) - 15 - 10);
+    }
+}
+
+// 从 Q6_K super-block 解包第 elemIdx 个 6-bit 值
+int unpack_q6_val(uint superBlockIdx, uint elemIdx) {
+    uint blockStart = superBlockIdx * Q6K_BLOCK_UINTS;
+
+    // 6-bit 值从 uint[5] 开始，4 个值打包在 3 字节中
+    uint quartetIdx = elemIdx / 4u;                    // 0..63
+    uint elemInQuartet = elemIdx % 4u;                 // 0..3
+
+    // 每组 4 个值占 3 字节，找到这 3 字节所在的 uint 和偏移
+    uint byteOffset = quartetIdx * 3u;                 // 0..189
+    uint wordIdx = byteOffset / 4u;                    // 对应 uint 索引
+    uint byteInWord = byteOffset % 4u;                 // 0..3
+
+    uint baseWord = blockStart + 5u + wordIdx;
+
+    // 读取 3 个连续字节（可能跨两个 uint 边界）
+    uint b0, b1, b2;
+    uint w0 = wq[baseWord];
+    b0 = (w0 >> (byteInWord * 8u)) & 0xFFu;
+
+    if (byteInWord == 3u) {
+        // 跨 uint 边界
+        uint w1 = wq[baseWord + 1u];
+        b1 = (w1 >> 0u) & 0xFFu;
+        b2 = (w1 >> 8u) & 0xFFu;
+    } else {
+        b1 = (w0 >> ((byteInWord + 1u) * 8u)) & 0xFFu;
+        if (byteInWord == 2u) {
+            uint w1 = wq[baseWord + 1u];
+            b2 = (w1 >> 0u) & 0xFFu;
+        } else {
+            b2 = (w0 >> ((byteInWord + 2u) * 8u)) & 0xFFu;
+        }
+    }
+
+    // 从 3 字节中提取 4 个 6-bit 值
+    int val;
+    if (elemInQuartet == 0u) {
+        val = int(b0 & 0x3Fu);
+    } else if (elemInQuartet == 1u) {
+        val = int(((b0 >> 6u) & 0x3u) | ((b1 & 0xFu) << 2u));
+    } else if (elemInQuartet == 2u) {
+        val = int(((b1 >> 4u) & 0xFu) | ((b2 & 0x3u) << 4u));
+    } else {
+        val = int((b2 >> 2u) & 0x3Fu);
+    }
+
+    // 有符号 6-bit: [-32, 31]
+    if (val >= 32) val = val - 64;
+
+    return val;
+}
+
+// 从 Q6_K super-block 解包并反量化第 elemIdx 个元素
+float dequant_q6_k(uint superBlockIdx, uint elemIdx) {
+    uint blockStart = superBlockIdx * Q6K_BLOCK_UINTS;
+
+    // 读取 super-block scale
+    uint dBits = wq[blockStart] & 0xFFFFu;
+    float d = fp16_to_fp32(dBits);
+
+    // 确定 sub-block
+    uint subIdx = elemIdx / Q6K_SUB_BLOCK;
+    uint subElem = elemIdx % Q6K_SUB_BLOCK;
+
+    // 读取 6-bit scale
+    uint scaleWord = (subIdx >> 2u) & 0x3u;
+    uint scaleByteInWord = subIdx & 0x3u;
+    uint scaleWordOffset = blockStart + 1u + scaleWord;
+    uint scaleByte = (wq[scaleWordOffset] >> (scaleByteInWord * 8u)) & 0xFFu;
+    uint scale6 = scaleByte & 0x3Fu;
+
+    // 读取 6-bit 值
+    int q = unpack_q6_val(superBlockIdx, elemIdx);
+
+    float subScale = d * float(scale6);
+    return float(q) * subScale;
+}
+
+shared float As[16][16];
+shared float Ws[16][16];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint lrow = gl_LocalInvocationID.y;
+    uint lcol = gl_LocalInvocationID.x;
+
+    if (row >= M || col >= N) return;
+
+    uint blocksPerCol = (K + Q6K_SUPER_BLOCK - 1u) / Q6K_SUPER_BLOCK;
+    float acc = 0.0f;
+    uint numTiles = (K + 15u) / 16u;
+
+    for (uint t = 0u; t < numTiles; ++t) {
+        // 加载 A 的 tile（float）
+        uint aCol = t * 16u + lcol;
+        As[lrow][lcol] = (aCol < K) ? a[row * K + aCol] : 0.0f;
+
+        // 加载 W 的 tile（Q6_K -> 反量化）
+        uint bRow = t * 16u + lrow;
+        float wVal = 0.0f;
+        if (bRow < K) {
+            uint superBlockIdx = col * blocksPerCol + bRow / Q6K_SUPER_BLOCK;
+            uint elemInSuper = bRow % Q6K_SUPER_BLOCK;
+            wVal = dequant_q6_k(superBlockIdx, elemInSuper);
+        }
+        Ws[lrow][lcol] = wVal;
+
+        barrier();
+
+        // 计算此 tile 的部分和
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += As[lrow][k] * Ws[k][lcol];
+        }
+        barrier();
+    }
+
+    if (hasBias != 0u) {
+        c[row * N + col] = acc + bias[col];
+    } else {
+        c[row * N + col] = acc;
+    }
+}

@@ -1,0 +1,42 @@
+#version 450
+// 数值稳定的 softmax（按行）：先求该行最大值 m，再 exp(x-m) 并归一化。
+// 用「共享内存归约」求 m 与 sum（同 ch07 的模式）。每行一个工作组，N<=64。
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer S { float s[]; };   // N*N，行主序 s[q*N + k]
+layout(std430, binding = 1) writeonly buffer P { float p[]; };   // N*N
+
+layout(push_constant) uniform PC { uint N; };
+
+shared float smax[64];
+shared float ssum[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y;
+    uint base = row * N;
+
+    // 1) 求行最大值 m（减 m 防止 exp 溢出，数值稳定）
+    float v = (tid < N) ? s[base + tid] : -1e30f;
+    smax[tid] = v;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (tid < step) smax[tid] = max(smax[tid], smax[tid + step]);
+        barrier();
+    }
+    float m = smax[0];
+
+    // 2) exp(x-m) 并归约求和
+    float e = (tid < N) ? exp(s[base + tid] - m) : 0.0f;
+    ssum[tid] = e;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (tid < step) ssum[tid] += ssum[tid + step];
+        barrier();
+    }
+    float sum = ssum[0];
+
+    // 3) 归一化
+    if (tid < N) p[base + tid] = e / sum;
+}

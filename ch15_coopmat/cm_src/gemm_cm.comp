@@ -1,0 +1,107 @@
+#version 450
+// Cooperative Matrix 矩阵乘 C = A * B，A: MxK, B: KxN, C: MxN
+// 使用 VK_KHR_cooperative_matrix 扩展，利用 Tensor Core / Matrix Core 硬件加速。
+//
+// 编译需要 -DUSE_COOPMAT 标志（由 CMakeLists.txt 自动处理）：
+//   glslc -DUSE_COOPMAT gemm_cm.comp -o gemm_cm.spv
+//
+// 回退路径使用独立的 gemm_tiled.comp（来自 ch04 的普通分块 GEMM）。
+//
+// 参考：GL_KHR_cooperative_matrix 规范 / Vulkan 教程
+//   https://docs.vulkan.org/tutorial/latest/Advanced_Vulkan_Compute/09_Specialized_Math/02_cooperative_matrices.html
+
+// --- 扩展声明 ---
+// GL_KHR_cooperative_matrix 提供 coopmat 类型和 coopmatLoad/Store/MulAdd 函数
+#extension GL_KHR_cooperative_matrix : require
+
+// --- 特化常量（Specialization Constants） ---
+// 用于 tile 尺寸：M_tile × N_tile × K_tile。
+// 这些值在 C++ 端通过 vkMakeSpecializationInfo 设置，
+// 编译器视其为常量表达式，可用于 coopmat 的类型参数。
+// 注意：必须与硬件支持的片段类型匹配（可通过 VkCooperativeMatrixPropertiesKHR 查询）。
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+// --- 工作组 ---
+// 每个工作组对应 C 的一个 TILE_M × TILE_N 小块
+// 注意：工作组尺寸必须与 subgroup 大小兼容（通常为 16×16 或 32×32）
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// --- 存储缓冲区 ---
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 2) buffer C { float c[]; };
+
+// --- Push Constants ---
+layout(push_constant) uniform PC {
+    uint strideA;   // A 的行跨度（元素数），即 K
+    uint strideB;   // B 的行跨度（元素数），即 N
+    uint strideC;   // C 的行跨度（元素数），即 N
+    uint K_total;   // K 的总维度
+};
+
+// ============================================================
+// 矩阵片段（Matrix Fragments）
+// 这些变量在文件作用域声明，由 Subgroup 内所有线程协作持有。
+// 每个线程只持有片段的一小部分数据，通过集体操作访问。
+// 维度参数使用特化常量，以便在 C++ 端根据不同硬件选择最优 tile 尺寸。
+// ============================================================
+
+// A 片段：TILE_M × TILE_K，作为矩阵乘的左操作数
+// 使用 gl_MatrixUseA 表示这是 A 矩阵的片段
+coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> fragA;
+
+// B 片段：TILE_K × TILE_N，作为矩阵乘的右操作数
+// 使用 gl_MatrixUseB 表示这是 B 矩阵的片段
+coopmat<float, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> fragB;
+
+// C 累加器片段：TILE_M × TILE_N，存储累加结果
+// 使用 gl_MatrixUseAccumulator 表示这是累加器
+coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> fragC;
+
+// ============================================================
+// 主函数
+// ============================================================
+void main() {
+    // 当前工作组负责的 C 矩阵 tile 的起始坐标
+    // 注意：coopmatLoad/Store 是 Subgroup 集体操作，所有线程必须同时调用。
+    // 偏移量是 tile 的起始位置，每个线程在 Subgroup 内协作加载/存储自己的部分。
+    uint tileRow = gl_WorkGroupID.y * TILE_M;   // tile 的起始行
+    uint tileCol = gl_WorkGroupID.x * TILE_N;   // tile 的起始列
+
+    // 从 C 矩阵加载初始值到累加器
+    // 对于 C = A * B 的首次调用，C 初始为 0，所以累加器被清零。
+    // 对于 C += A * B 的累积调用，C 中的已有值会被加载。
+    // 参数：(片段, 内存缓冲, 步长, 布局, 偏移)
+    // 偏移量以元素为单位（不是字节）
+    uint cOffset = tileRow * strideC + tileCol;
+    coopmatLoad(fragC, c, strideC, gl_CooperativeMatrixLayoutRowMajor, cOffset);
+
+    // K 维度的 tile 数（向上取整）
+    // 使用 TILE_K 作为分块大小
+    uint numTiles = (K_total + TILE_K - 1u) / TILE_K;
+
+    for (uint t = 0u; t < numTiles; ++t) {
+        uint k = t * TILE_K;
+
+        // 加载 A 的片段：从 A[tileRow][k] 开始，大小 TILE_M × TILE_K
+        // 每个线程合作从全局内存加载对应元素到寄存器分布存储
+        uint aOffset = tileRow * strideA + k;
+        coopmatLoad(fragA, a, strideA, gl_CooperativeMatrixLayoutRowMajor, aOffset);
+
+        // 加载 B 的片段：从 B[k][tileCol] 开始，大小 TILE_K × TILE_N
+        uint bOffset = k * strideB + tileCol;
+        coopmatLoad(fragB, b, strideB, gl_CooperativeMatrixLayoutRowMajor, bOffset);
+
+        // 执行矩阵乘加：fragC = fragA * fragB + fragC
+        // 这由 Tensor Core / Matrix Core 硬件在单条指令中完成，
+        // 等价于 TILE_M * TILE_K * TILE_N 次标量 FMA 操作。
+        // 以 16×16×16 为例，单条指令完成 4096 次 FMA。
+        fragC = coopmatMulAdd(fragA, fragB, fragC);
+    }
+
+    // 将累加器结果存储回 C 矩阵
+    // coopmatStore 也是 Subgroup 集体操作
+    coopmatStore(c, fragC, strideC, gl_CooperativeMatrixLayoutRowMajor, cOffset);
+}

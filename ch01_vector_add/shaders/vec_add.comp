@@ -1,0 +1,17 @@
+#version 450
+// 向量加法：c[i] = a[i] + b[i]
+// 计算着色器由无数个「线程」并行执行，本例每个线程负责一个元素。
+
+layout(local_size_x = 64) in;   // 一个工作组 64 个线程
+
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC { uint n; };  // 元素个数，从 CPU 压入
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;   // 全局线程编号 = 元素下标
+    if (i >= n) return;                 // 边界保护：总数不一定是 64 的整数倍
+    c[i] = a[i] + b[i];
+}

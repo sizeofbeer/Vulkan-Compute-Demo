@@ -1,0 +1,144 @@
+#version 450
+// MXFP4 融合反量化 GEMM: C[M,N] = A[M,K] * W_mxfp4[K,N] + bias[N]
+//
+// MXFP4 格式（OCP 标准，E2M1）：
+//   - 每 32 个元素为一个 block
+//   - 每个 block: [fp16 scale] + [16 字节 packed 4-bit E2M1 数据]
+//   - E2M1: 1 sign + 2 exponent + 1 mantissa, bias=1
+//   - 解码值（正数）：0, 0.25, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+//   - 反量化：w = decode_e2m1(val) * scale
+//   - 使用 fp16 算术（如果硬件支持）
+//
+// 每个 block 的布局（5 × uint32 = 20 字节）：
+//   uint[0] : low 16 bits = fp16 scale
+//   uint[1..4] : 16 字节 packed 4-bit E2M1 数据（32 元素）
+//
+// 绑定：
+//   0: A (float)       — M×K 激活矩阵
+//   1: W_mxfp4 (uint)  — K×N 量化权重矩阵
+//   2: Bias (float)    — N 维偏置
+//   3: C (float)       — M×N 输出矩阵
+//
+// Push constants: { M, N, K, hasBias }
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer A     { float a[]; };
+layout(std430, binding = 1) readonly buffer Wq    { uint wq[]; };
+layout(std430, binding = 2) readonly buffer Bias  { float bias[]; };
+layout(std430, binding = 3) writeonly buffer C    { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint hasBias;
+};
+
+// MXFP4 block 常量
+const uint MXFP4_BLOCK_SIZE = 32u;
+const uint MXFP4_BLOCK_UINTS = 5u;
+
+// fp16 -> fp32 转换
+float fp16_to_fp32(uint bits) {
+    uint s = (bits >> 15u) & 0x1u;
+    uint e = (bits >> 10u) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(m), -24);
+    } else if (e == 31u) {
+        return (m == 0u) ? (s != 0u ? -1.0/0.0 : 1.0/0.0) : 0.0/0.0;
+    } else {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(0x400u | m), int(e) - 15 - 10);
+    }
+}
+
+// 解码 E2M1 4-bit 值为 float
+// E2M1: bit[3]=sign, bit[2:1]=exp, bit[0]=mant, bias=1
+float decode_e2m1(uint val) {
+    uint sign = (val >> 3u) & 0x1u;
+    uint exp  = (val >> 1u) & 0x3u;
+    uint mant = val & 0x1u;
+
+    float f;
+    if (exp == 0u) {
+        // 次正规或零
+        f = (mant == 0u) ? 0.0f : 0.25f;  // 0.25 = 2^(-2) * 0.5 * 2
+    } else {
+        // 正规数：value = (1 + mant/2) * 2^(exp - 1)
+        // exp=1 -> 2^0 * (1 + mant/2) = 1.0 or 1.5
+        // exp=2 -> 2^1 * (1 + mant/2) = 2.0 or 3.0
+        // exp=3 -> 2^2 * (1 + mant/2) = 4.0 or 6.0
+        float base = 1.0f + float(mant) * 0.5f;
+        f = base * exp2(float(int(exp) - 1));
+    }
+
+    return (sign != 0u) ? -f : f;
+}
+
+// 从 MXFP4 block 解包并反量化第 elemInBlock 个元素
+float dequant_mxfp4(uint blockStart, uint elemInBlock) {
+    // 第 0 个 uint 的低 16 位 = fp16 scale
+    uint scaleBits = wq[blockStart] & 0xFFFFu;
+    float scale = fp16_to_fp32(scaleBits);
+
+    // qs[] 起始于 block 内字节偏移 2（前 2 字节为 fp16 scale d）
+    uint byteIdx = elemInBlock / 2u;
+    uint nibbleShift = (elemInBlock & 1u) == 0u ? 0u : 4u;
+    uint byteOffset = 2u + byteIdx;            // 块内绝对字节偏移
+    uint wordIdx = byteOffset / 4u;
+    uint byteInWord = byteOffset % 4u;
+
+    uint word = wq[blockStart + wordIdx];
+    uint byteVal = (word >> (byteInWord * 8u)) & 0xFFu;
+    uint val = (byteVal >> nibbleShift) & 0xFu;
+
+    float decoded = decode_e2m1(val);
+    return decoded * scale;
+}
+
+shared float As[16][16];
+shared float Ws[16][16];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint lrow = gl_LocalInvocationID.y;
+    uint lcol = gl_LocalInvocationID.x;
+
+    if (row >= M || col >= N) return;
+
+    uint blocksPerCol = (K + MXFP4_BLOCK_SIZE - 1u) / MXFP4_BLOCK_SIZE;
+    float acc = 0.0f;
+    uint numTiles = (K + 15u) / 16u;
+
+    for (uint t = 0u; t < numTiles; ++t) {
+        // 加载 A 的 tile（float）
+        uint aCol = t * 16u + lcol;
+        As[lrow][lcol] = (aCol < K) ? a[row * K + aCol] : 0.0f;
+
+        // 加载 W 的 tile（MXFP4 -> 反量化）
+        uint bRow = t * 16u + lrow;
+        float wVal = 0.0f;
+        if (bRow < K) {
+            uint blockIdx = col * blocksPerCol + bRow / MXFP4_BLOCK_SIZE;
+            uint elemInBlock = bRow % MXFP4_BLOCK_SIZE;
+            wVal = dequant_mxfp4(blockIdx * MXFP4_BLOCK_UINTS, elemInBlock);
+        }
+        Ws[lrow][lcol] = wVal;
+
+        barrier();
+
+        // 计算此 tile 的部分和
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += As[lrow][k] * Ws[k][lcol];
+        }
+        barrier();
+    }
+
+    if (hasBias != 0u) {
+        c[row * N + col] = acc + bias[col];
+    } else {
+        c[row * N + col] = acc;
+    }
+}

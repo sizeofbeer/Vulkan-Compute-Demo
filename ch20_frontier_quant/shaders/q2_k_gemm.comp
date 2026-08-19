@@ -1,0 +1,139 @@
+#version 450
+// Q2_K 融合反量化 GEMM: C[M,N] = A[M,K] * W_q2_k[K,N] + bias[N]
+//
+// Q2_K 格式（简化版，基于 ggml K-quant 思想）：
+//   - Super-block: 256 个元素，分成 16 个 sub-block（各 16 元素）
+//   - 每个 sub-block 共享一个 6-bit scale
+//   - 2-bit 有符号值（中心化到 0），打包 4 个/字节
+//   - 反量化：w = (val - 1) * (d * scale)
+//
+// 每个 super-block 的布局（21 × uint32 = 84 字节）：
+//   uint[0]  : low 16 bits = fp16 d (super-block scale)
+//              high 16 bits = fp16 dmin (super-block minimum)
+//   uint[1..4] : 16 × uint8 scales (6-bit scale per sub-block)
+//   uint[5..20] : 64 字节 packed 2-bit 数据（256 元素）
+//
+// 绑定：
+//   0: A (float)       — M×K 激活矩阵
+//   1: W_q2_k (uint)   — K×N 量化权重矩阵
+//   2: Bias (float)    — N 维偏置
+//   3: C (float)       — M×N 输出矩阵
+//
+// Push constants: { M, N, K, hasBias }
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer A     { float a[]; };
+layout(std430, binding = 1) readonly buffer Wq    { uint wq[]; };
+layout(std430, binding = 2) readonly buffer Bias  { float bias[]; };
+layout(std430, binding = 3) writeonly buffer C    { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint hasBias;
+};
+
+// Q2_K super-block 常量
+const uint Q2K_SUPER_BLOCK = 256u;    // 每个 super-block 256 元素
+const uint Q2K_SUB_BLOCK   = 16u;     // 每个 sub-block 16 元素
+const uint Q2K_NUM_SUBS    = 16u;     // 16 个 sub-block
+const uint Q2K_BLOCK_UINTS = 21u;     // 每个 super-block 21 个 uint32
+
+// fp16 -> fp32 转换
+float fp16_to_fp32(uint bits) {
+    uint s = (bits >> 15u) & 0x1u;
+    uint e = (bits >> 10u) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(m), -24);
+    } else if (e == 31u) {
+        return (m == 0u) ? (s != 0u ? -1.0/0.0 : 1.0/0.0) : 0.0/0.0;
+    } else {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(0x400u | m), int(e) - 15 - 10);
+    }
+}
+
+// 从 Q2_K super-block 解包并反量化第 elemIdx 个元素（全局索引）
+float dequant_q2_k(uint superBlockIdx, uint elemIdx) {
+    uint blockStart = superBlockIdx * Q2K_BLOCK_UINTS;
+
+    // 读取 super-block scale
+    uint dBits = wq[blockStart] & 0xFFFFu;
+    uint dminBits = (wq[blockStart] >> 16u) & 0xFFFFu;
+    float d = fp16_to_fp32(dBits);
+    float dmin = fp16_to_fp32(dminBits);
+
+    // 确定 sub-block 和元素在 sub-block 中的位置
+    uint subIdx = elemIdx / Q2K_SUB_BLOCK;        // 0..15
+    uint subElem = elemIdx % Q2K_SUB_BLOCK;        // 0..15
+
+    // 读取 6-bit scale（存储在 uint[1..4] 中）
+    uint scaleWord = (subIdx >> 2u) & 0x3u;        // 0..3
+    uint scaleByteInWord = subIdx & 0x3u;           // 0..3
+    uint scaleWordOffset = blockStart + 1u + scaleWord;
+    uint scaleByte = (wq[scaleWordOffset] >> (scaleByteInWord * 8u)) & 0xFFu;
+    uint scale6 = scaleByte & 0x3Fu;                // 低 6 位是 scale
+
+    // 读取 2-bit 值
+    uint byteIdx = elemIdx / 4u;                    // 0..63 字节索引
+    uint nibbleShift = (elemIdx & 3u) * 2u;         // 0, 2, 4, 6
+    uint wordIdx = byteIdx / 4u;                    // 0..15 uint 索引
+    uint byteInWord = byteIdx % 4u;                 // 0..3
+
+    uint word = wq[blockStart + 5u + wordIdx];
+    uint byteVal = (word >> (byteInWord * 8u)) & 0xFFu;
+    int q = int((byteVal >> nibbleShift) & 0x3u);
+
+    // 2-bit 无符号值 [0, 3]，中心化到 [-1, 2]
+    // 使用 d 和 dmin 组合得到实际 scale
+    float subScale = d * float(scale6);
+    return (float(q) - 1.0f) * subScale;
+}
+
+shared float As[16][16];
+shared float Ws[16][16];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint lrow = gl_LocalInvocationID.y;
+    uint lcol = gl_LocalInvocationID.x;
+
+    if (row >= M || col >= N) return;
+
+    uint blocksPerCol = (K + Q2K_SUPER_BLOCK - 1u) / Q2K_SUPER_BLOCK;
+    float acc = 0.0f;
+    uint numTiles = (K + 15u) / 16u;
+
+    for (uint t = 0u; t < numTiles; ++t) {
+        // 加载 A 的 tile（float）
+        uint aCol = t * 16u + lcol;
+        As[lrow][lcol] = (aCol < K) ? a[row * K + aCol] : 0.0f;
+
+        // 加载 W 的 tile（Q2_K -> 反量化）
+        uint bRow = t * 16u + lrow;
+        float wVal = 0.0f;
+        if (bRow < K) {
+            uint superBlockIdx = col * blocksPerCol + bRow / Q2K_SUPER_BLOCK;
+            uint elemInSuper = bRow % Q2K_SUPER_BLOCK;
+            wVal = dequant_q2_k(superBlockIdx, elemInSuper);
+        }
+        Ws[lrow][lcol] = wVal;
+
+        barrier();
+
+        // 计算此 tile 的部分和
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += As[lrow][k] * Ws[k][lcol];
+        }
+        barrier();
+    }
+
+    if (hasBias != 0u) {
+        c[row * N + col] = acc + bias[col];
+    } else {
+        c[row * N + col] = acc;
+    }
+}

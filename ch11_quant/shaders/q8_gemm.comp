@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+// 融合反量化矩阵乘：权重以 int8 存储（省 4 倍显存/带宽），GPU 读取时当场 (q*scale) 还原成 float 再累加。
+// 「反量化」融合在 matmul 内层，不需要先单独把权重解压成 float——这就是 llama.cpp 省显存的核心手法。
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly buffer A  { float a[]; };     // M*K 激活（float）
+layout(std430, binding = 1) readonly buffer Wq { int8_t w[]; };    // K*N 权重（int8，省 4x）
+layout(std430, binding = 2) writeonly buffer C  { float c[]; };    // M*N 输出（float）
+layout(push_constant) uniform PC { uint M; uint N; uint K; float scale; };
+void main() {
+    uint r = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (r >= M || col >= N) return;
+    float acc = 0.0f;
+    for (uint k = 0u; k < K; ++k)
+        acc += a[r * K + k] * (float(w[k * N + col]) * scale);   // 就地反量化
+    c[r * N + col] = acc;
+}

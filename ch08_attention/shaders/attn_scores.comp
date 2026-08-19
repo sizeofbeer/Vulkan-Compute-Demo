@@ -1,0 +1,20 @@
+#version 450
+// 注意力分数：S[q,k] = (Q[q] · K[k]) / sqrt(D)。每个线程算一个 (query, key) 对。
+// 这一步就是一次「矩阵乘 Q·Kᵀ」的单个元素（见 ch04）。
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };   // N*D
+layout(std430, binding = 1) readonly buffer K { float k[]; };   // N*D
+layout(std430, binding = 2) writeonly buffer S { float s[]; };  // N*N
+
+layout(push_constant) uniform PC { uint N; uint D; };
+
+void main() {
+    uint qi = gl_GlobalInvocationID.y;   // query 行
+    uint ki = gl_GlobalInvocationID.x;   // key 列
+    if (qi >= N || ki >= N) return;
+    float dot = 0.0f;
+    for (uint d = 0; d < D; ++d) dot += q[qi * D + d] * k[ki * D + d];
+    s[qi * N + ki] = dot / sqrt(float(D));
+}

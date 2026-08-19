@@ -1,0 +1,63 @@
+#version 450
+// ch19_moe/shaders/combine.comp
+// Combine expert outputs: weighted sum of per-expert contributions
+//
+// For each token t and each output element d:
+//   final_out[t, d] = Σ_{k=0}^{top_k-1} weights[t, k] × expert_out[indices[t, k], t, d]
+//
+// Input:
+//   expert_outputs  [num_experts, num_tokens, hidden_dim]  — each expert's raw output
+//   expert_indices  [num_tokens, top_k]  — which experts were selected per token
+//   expert_weights  [num_tokens, top_k]  — routing weights (softmax values)
+// Output:
+//   final_output    [num_tokens, hidden_dim]  — combined result
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer ExpertOutputs {
+    float exp_out[];   // [num_experts, num_tokens, hidden_dim]
+};
+
+layout(std430, binding = 1) readonly buffer ExpertIndices {
+    uint indices[];    // [num_tokens, top_k]
+};
+
+layout(std430, binding = 2) readonly buffer ExpertWeights {
+    float weights[];   // [num_tokens, top_k]
+};
+
+layout(std430, binding = 3) writeonly buffer FinalOutput {
+    float final_out[]; // [num_tokens, hidden_dim]
+};
+
+layout(push_constant) uniform PC {
+    uint num_tokens;
+    uint num_experts;
+    uint top_k;
+    uint hidden_dim;
+};
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;  // token index
+    uint col = gl_GlobalInvocationID.x;  // hidden dimension index
+
+    if (row >= num_tokens || col >= hidden_dim) return;
+
+    float acc = 0.0f;
+
+    // Sum over the top-k experts assigned to this token
+    for (uint k = 0u; k < top_k; ++k) {
+        uint expert_idx = indices[row * top_k + k];
+        float weight    = weights[row * top_k + k];
+
+        // Locate expert_outputs[expert_idx, row, col]
+        // Layout: [expert_idx][token][hidden]
+        uint offset = expert_idx * num_tokens * hidden_dim
+                    + row * hidden_dim
+                    + col;
+
+        acc += weight * exp_out[offset];
+    }
+
+    final_out[row * hidden_dim + col] = acc;
+}

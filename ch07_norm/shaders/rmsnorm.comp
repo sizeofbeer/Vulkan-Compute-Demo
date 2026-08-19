@@ -1,0 +1,40 @@
+#version 450
+// RMSNorm（均方根归一化）：对每个样本（一行特征）先算 rms = sqrt(mean(x^2))，再 x/rms，最后乘 gamma。
+// 关键：rms 需要「跨元素求和」——同一个工作组内的线程用共享内存做归约（reduction）协作算出它。
+// 本教学版假设 F（特征维）<= 256 = 一个工作组线程数；更大时需在 shader 里做多趟归约（见 docs）。
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };  // R*F
+layout(std430, binding = 1) writeonly buffer Y { float y[]; }; // R*F
+layout(std430, binding = 2) readonly buffer G { float g[]; };  // F（gamma 缩放）
+
+layout(push_constant) uniform PC { uint R; uint F; };
+
+shared float ssum[256];   // 工作组内共享：平方 partial sum
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;        // 0..255
+    uint row = gl_WorkGroupID.y;              // 第几行样本
+    uint base = row * F;
+
+    // 1) 每个线程负责一个特征元素，算平方
+    float acc = 0.0f;
+    if (tid < F) { float v = x[base + tid]; acc = v * v; }
+    ssum[tid] = acc;
+    barrier();
+
+    // 2) 树形归约：把 256 个平方求和到 ssum[0]
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) ssum[tid] += ssum[tid + s];
+        barrier();
+    }
+
+    // 3) 所有线程读到同一个 rms，做归一化 + gamma
+    float rms = sqrt(ssum[0] / float(F));
+    float inv = 1.0f / rms;
+    if (tid < F) {
+        float v = x[base + tid] * inv;
+        y[base + tid] = v * g[tid];
+    }
+}

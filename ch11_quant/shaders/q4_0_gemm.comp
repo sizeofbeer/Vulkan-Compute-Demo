@@ -1,0 +1,123 @@
+#version 450
+// Q4_0 量化融合反量化 GEMM: C[M,N] = A[M,K] * W_q4_0[K,N] + bias[N]（可选）
+//
+// Q4_0 格式（ggml 兼容，20 字节对齐版）：
+//   - 每 32 个元素为一个 block
+//   - 每个 block: [fp16 scale] + [16 字节 packed 4-bit 数据] + [2 字节 padding]
+//   - 20 字节 = 5 × uint32，方便 GPU 访问
+//   - 4-bit 数据：有符号 int4，低 4 位 = 元素 i，高 4 位 = 元素 i+1
+//   - 反量化：w = float(q) * scale
+//
+// 共享内存分块 tiling：16×16 的 tile。
+//
+// 绑定：
+//   0: A (float)       — M×K 激活矩阵
+//   1: W_q4_0 (uint)   — K×N 量化权重矩阵（每 block 5 uint）
+//   2: Bias (float)    — N 维偏置（可选，绑定空 buffer 或 hasBias=0 时跳过）
+//   3: C (float)       — M×N 输出矩阵
+//
+// Push constants: { M, N, K, hasBias }
+//   hasBias = 0 时跳过偏置加法
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer A     { float a[]; };
+layout(std430, binding = 1) readonly buffer Wq    { uint wq[]; };
+layout(std430, binding = 2) readonly buffer Bias  { float bias[]; };
+layout(std430, binding = 3) writeonly buffer C    { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint hasBias;
+};
+
+// 每 block 32 个元素，20 字节（5 × uint32）
+const uint Q4_BLOCK_SIZE = 32u;
+const uint Q4_BLOCK_UINTS = 5u;
+
+// 手动 fp16 -> fp32 转换
+float fp16_to_fp32(uint bits) {
+    uint s = (bits >> 15u) & 0x1u;
+    uint e = (bits >> 10u) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) {
+        // 次正规数：指数固定为 -14，尾数隐含 0
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(m), -24);
+    } else if (e == 31u) {
+        return (m == 0u) ? (s != 0u ? -1.0/0.0 : 1.0/0.0) : 0.0/0.0;
+    } else {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(0x400u | m), int(e) - 15 - 10);
+    }
+}
+
+// 从 Q4_0 block 解包并反量化第 elemInBlock 个元素
+// blockStart: 该 block 在 wq[] 中的起始 uint 索引
+float dequant_q4_0(uint blockStart, uint elemInBlock) {
+    // 第 0 个 uint 的低 16 位 = fp16 scale
+    uint scaleBits = wq[blockStart] & 0xFFFFu;
+    float scale = fp16_to_fp32(scaleBits);
+
+    // qs[] 起始于 block 内字节偏移 2（前 2 字节为 fp16 scale d），故实际字节偏移 = 2 + byteIdx
+    uint byteIdx = elemInBlock / 2u;           // 0..15 qs 字节索引
+    uint nibbleShift = (elemInBlock & 1u) == 0u ? 0u : 4u;
+    uint byteOffset = 2u + byteIdx;            // 块内绝对字节偏移
+    uint wordIdx = byteOffset / 4u;            // 0..4 uint 索引
+    uint byteInWord = byteOffset % 4u;         // 0..3 字节内偏移
+
+    uint word = wq[blockStart + wordIdx];
+    uint byteVal = (word >> (byteInWord * 8u)) & 0xFFu;
+    int q = int((byteVal >> nibbleShift) & 0xFu);
+
+    // 有符号 int4: [-8, 7]
+    if (q >= 8) q = q - 16;
+
+    return float(q) * scale;
+}
+
+shared float As[16][16];
+shared float Ws[16][16];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint lrow = gl_LocalInvocationID.y;
+    uint lcol = gl_LocalInvocationID.x;
+
+    if (row >= M || col >= N) return;
+
+    uint blocksPerCol = (K + Q4_BLOCK_SIZE - 1u) / Q4_BLOCK_SIZE;
+    float acc = 0.0f;
+    uint numTiles = (K + 15u) / 16u;
+
+    for (uint t = 0u; t < numTiles; ++t) {
+        // 加载 A 的 tile（float）
+        uint aCol = t * 16u + lcol;
+        As[lrow][lcol] = (aCol < K) ? a[row * K + aCol] : 0.0f;
+
+        // 加载 W 的 tile（Q4_0 -> 反量化）
+        uint bRow = t * 16u + lrow;
+        float wVal = 0.0f;
+        if (bRow < K) {
+            uint blockIdx = col * blocksPerCol + bRow / Q4_BLOCK_SIZE;
+            uint elemInBlock = bRow % Q4_BLOCK_SIZE;
+            wVal = dequant_q4_0(blockIdx * Q4_BLOCK_UINTS, elemInBlock);
+        }
+        Ws[lrow][lcol] = wVal;
+
+        barrier();
+
+        // 计算此 tile 的部分和
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += As[lrow][k] * Ws[k][lcol];
+        }
+        barrier();
+    }
+
+    if (hasBias != 0u) {
+        c[row * N + col] = acc + bias[col];
+    } else {
+        c[row * N + col] = acc;
+    }
+}

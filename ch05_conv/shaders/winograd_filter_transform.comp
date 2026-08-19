@@ -1,0 +1,75 @@
+#version 450
+// Winograd 滤波器变换 F(2×2, 3×3)：U = G @ g @ G^T
+// 将 3×3 卷积核变换到 4×4 Winograd 域。
+//
+// G = [[1,    0,   0  ],
+//      [0.5,  0.5, 0.5],
+//      [0.5, -0.5, 0.5],
+//      [0,    0,   1  ]]
+//
+// 每个工作组处理一个 (oc, cin) 对，16 个线程共同计算 4×4 输出。
+
+layout(local_size_x = 16) in;
+
+layout(std430, binding = 0) readonly buffer Wt { float w[]; };   // Cout × Cin × 3 × 3
+layout(std430, binding = 2) writeonly buffer U  { float u[]; };  // Cout × Cin × 4 × 4
+
+layout(push_constant) uniform PC {
+    uint Cout;
+    uint Cin;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uint _pad3;
+};
+
+// G 矩阵 (4×3)
+const float G[12] = float[](
+    1.0,  0.0,  0.0,
+    0.5,  0.5,  0.5,
+    0.5, -0.5,  0.5,
+    0.0,  0.0,  1.0
+);
+
+// G^T 矩阵 (3×4)
+const float GT[12] = float[](
+    1.0,  0.5,  0.5,  0.0,
+    0.0,  0.5, -0.5,  0.0,
+    0.0,  0.5,  0.5,  1.0
+);
+
+void main() {
+    uint oc = gl_GlobalInvocationID.x;     // 0 .. Cout-1
+    uint cin = gl_GlobalInvocationID.y;    // 0 .. Cin-1
+    if (oc >= Cout || cin >= Cin) return;
+
+    // 读取 3×3 滤波器权重 g[oc][cin][ky][kx]
+    float g[9];
+    uint base = oc * Cin * 9 + cin * 9;
+    for (uint ky = 0; ky < 3; ++ky)
+        for (uint kx = 0; kx < 3; ++kx)
+            g[ky * 3 + kx] = w[base + ky * 3 + kx];
+
+    // 计算 temp = g @ G^T (3×3 @ 3×4 = 3×4)
+    // temp[m][n] = sum_{j=0}^2 g[m][j] * GT[j][n]
+    float temp[12]; // 3×4
+    for (uint m = 0; m < 3; ++m) {
+        for (uint n = 0; n < 4; ++n) {
+            float s = 0.0;
+            for (uint j = 0; j < 3; ++j)
+                s += g[m * 3 + j] * GT[j * 4 + n];
+            temp[m * 4 + n] = s;
+        }
+    }
+
+    // 计算 U = G @ temp (4×3 @ 3×4 = 4×4)
+    // U[i][j] = sum_{m=0}^2 G[i][m] * temp[m][j]
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) {
+            float s = 0.0;
+            for (uint m = 0; m < 3; ++m)
+                s += G[i * 3 + m] * temp[m * 4 + j];
+            u[oc * Cin * 16 + cin * 16 + i * 4 + j] = s;
+        }
+    }
+}

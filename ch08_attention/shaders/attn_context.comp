@@ -1,0 +1,20 @@
+#version 450
+// 注意力上下文：O[q,d] = Σ_k P[q,k] * V[k,d]。每个线程算一个 (query, 输出维) 对。
+// 这是一次「矩阵乘 P·V」的单个元素——注意力 = 两个矩阵乘夹一个 softmax。
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer P { float p[]; };   // N*N（softmax 后）
+layout(std430, binding = 1) readonly buffer V { float v[]; };   // N*D
+layout(std430, binding = 2) writeonly buffer O { float o[]; };  // N*D
+
+layout(push_constant) uniform PC { uint N; uint D; };
+
+void main() {
+    uint q = gl_GlobalInvocationID.y;
+    uint d = gl_GlobalInvocationID.x;
+    if (q >= N || d >= D) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < N; ++k) acc += p[q * N + k] * v[k * D + d];
+    o[q * D + d] = acc;
+}

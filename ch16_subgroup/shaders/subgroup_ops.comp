@@ -1,0 +1,115 @@
+#version 450
+// ch16_subgroup/shaders/subgroup_ops.comp
+// 演示 Vulkan subgroup 操作：basic / vote / arithmetic / ballot / shuffle / softmax
+// 通过 specialization constant OP_MODE 选择操作类型
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 64) in;
+
+// 0=basic, 1=vote, 2=arithmetic, 3=ballot, 4=shuffle, 5=softmax
+layout(constant_id = 0) const int OP_MODE = 0;
+
+layout(std430, binding = 0) readonly buffer Input  { float inp[]; };
+layout(std430, binding = 1) writeonly buffer Output { float outp[]; };
+
+layout(push_constant) uniform PC { uint N; };
+
+void main() {
+    uint tid   = gl_LocalInvocationID.x;
+    uint gid   = gl_GlobalInvocationID.x;
+    uint sgid  = gl_SubgroupInvocationID;
+    uint sgsz  = gl_SubgroupSize;
+    uint numSg = gl_NumSubgroups;
+    uint base  = gid * 4u;
+
+    // ─── Mode 0: Basic Info ────────────────────────────────────────────
+    if (OP_MODE == 0) {
+        // 每个线程输出 subgroup 基本信息
+        outp[base + 0u] = float(sgsz);       // 本 subgroup 的宽度
+        outp[base + 1u] = float(sgid);       // 本线程在 subgroup 中的索引
+        outp[base + 2u] = float(numSg);      // 本工作组内 subgroup 数量
+        outp[base + 3u] = 0.0f;
+        return;
+    }
+
+    // ─── Mode 1: Vote ──────────────────────────────────────────────────
+    if (OP_MODE == 1) {
+        // 条件：值 > 0.5
+        float v     = (gid < N) ? inp[gid] : 0.0f;
+        bool cond   = v > 0.5f;
+        uvec4 ballot = subgroupBallot(cond);
+        bool allTrue = subgroupAll(cond);
+        bool anyTrue = subgroupAny(cond);
+        outp[base + 0u] = float(ballot.x);
+        outp[base + 1u] = allTrue ? 1.0f : 0.0f;
+        outp[base + 2u] = anyTrue ? 1.0f : 0.0f;
+        outp[base + 3u] = 0.0f;
+        return;
+    }
+
+    // ─── Mode 2: Arithmetic ────────────────────────────────────────────
+    if (OP_MODE == 2) {
+        float v   = (gid < N) ? inp[gid] : 0.0f;
+        float sum = subgroupAdd(v);
+        float mn  = subgroupMin(v);
+        float mx  = subgroupMax(v);
+        outp[base + 0u] = sum;
+        outp[base + 1u] = mn;
+        outp[base + 2u] = mx;
+        outp[base + 3u] = 0.0f;
+        return;
+    }
+
+    // ─── Mode 3: Ballot ────────────────────────────────────────────────
+    if (OP_MODE == 3) {
+        float v   = (gid < N) ? inp[gid] : 0.0f;
+        bool cond = v > 0.0f;
+        uvec4 ballot  = subgroupBallot(cond);
+        uint cnt      = bitCount(ballot.x);   // 在 subgroup 中条件为真的线程数
+        outp[base + 0u] = float(ballot.x);
+        outp[base + 1u] = float(cnt);
+        outp[base + 2u] = 0.0f;
+        outp[base + 3u] = 0.0f;
+        return;
+    }
+
+    // ─── Mode 4: Shuffle ───────────────────────────────────────────────
+    if (OP_MODE == 4) {
+        float v    = (gid < N) ? inp[gid] : 0.0f;
+        float bcast = subgroupBroadcast(v, 0u);       // 从 lane 0 广播
+        float shuf  = subgroupShuffle(v, (sgid + 1u) % sgsz); // 从下一个线程取
+        outp[base + 0u] = v;
+        outp[base + 1u] = bcast;
+        outp[base + 2u] = shuf;
+        outp[base + 3u] = 0.0f;
+        return;
+    }
+
+    // ─── Mode 5: Softmax (warp-level) ──────────────────────────────────
+    if (OP_MODE == 5) {
+        // 每个线程持有行中的一个元素，整行必须在一个 subgroup 内
+        // 使用 subgroup ops 替代共享内存做归约
+        uint idx = gid;
+        float v  = (idx < N) ? inp[idx] : -1e30f;
+
+        // Step 1: 求行最大值（数值稳定）
+        float m = subgroupMax(v);
+
+        // Step 2: exp(x - max)
+        float e = exp(v - m);
+
+        // Step 3: 求和
+        float sum = subgroupAdd(e);
+
+        // Step 4: 归一化
+        if (idx < N) {
+            outp[idx] = e / sum;
+        }
+        return;
+    }
+}

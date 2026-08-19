@@ -1,0 +1,18 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+// FP16 存储 buffer 往返：输入以 half（float16_t）存储，读出转 float32 计算，写出 float32。
+// 注意：shader 要用 float16_t，必须在设备启用 storageBuffer16BitAccess 特性（common 已启用）。
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer A { float16_t a[]; };  // 半精度输入，省一半带宽
+layout(std430, binding = 1) writeonly buffer C { float c[]; };     // 全精度输出
+
+layout(push_constant) uniform PC { uint n; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+    float v = float(a[i]);     // half -> float32（硬件或软件转换）
+    c[i] = v * 2.0f;
+}

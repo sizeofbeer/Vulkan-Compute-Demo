@@ -1,0 +1,99 @@
+#version 450
+// Winograd 输入变换 F(2×2, 3×3)：V = BT @ d @ B
+// 将 4×4 输入 tile 变换到 Winograd 域。
+//
+// B^T = [[1,  0, -1,  0],
+//        [0,  1,  1,  0],
+//        [0, -1,  1,  0],
+//        [0,  1,  0, -1]]
+//
+// B   = [[1,  0,  0,  0],
+//        [0,  1, -1,  1],
+//        [-1, 1,  1,  0],
+//        [0,  0,  0, -1]]
+//
+// 每个工作组处理一个 tile（一个 4×4 输入块，对应 2×2 输出）。
+// 16 个线程共同计算 4×4 变换结果。
+
+layout(local_size_x = 16) in;
+
+layout(std430, binding = 0) readonly buffer Inp { float inp[]; };  // Cin × H × W
+layout(std430, binding = 2) writeonly buffer V  { float v[]; };   // Cin × total_tiles × 16
+
+layout(push_constant) uniform PC {
+    uint H;           // 输入高
+    uint W;           // 输入宽
+    uint num_tiles_x; // 每行 tile 数
+    uint Cin;
+    uint _pad0;
+    uint _pad1;
+};
+
+// B^T 矩阵 (4×4)
+const float BT[16] = float[](
+    1.0,  0.0, -1.0,  0.0,
+    0.0,  1.0,  1.0,  0.0,
+    0.0, -1.0,  1.0,  0.0,
+    0.0,  1.0,  0.0, -1.0
+);
+
+// B 矩阵 (4×4) = BT 的转置
+const float B[16] = float[](
+    1.0,  0.0,  0.0,  0.0,
+    0.0,  1.0, -1.0,  1.0,
+   -1.0,  1.0,  1.0,  0.0,
+    0.0,  0.0,  0.0, -1.0
+);
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;    // 全局 tile ID
+    uint cin = gl_GlobalInvocationID.y;    // 输入通道
+    uint total_tiles = num_tiles_x * ((H + 1) / 2);
+    if (tid >= total_tiles || cin >= Cin) return;
+
+    uint ty = tid / num_tiles_x;
+    uint tx = tid % num_tiles_x;
+
+    // 提取 4×4 输入 tile（带 padding）
+    // 在原始输入中，tile 的左上角对应 (ty*2 - 1, tx*2 - 1)
+    float d[16]; // 4×4 输入 tile
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) {
+            int iy = int(ty * 2) + int(i) - 1;  // pad=1
+            int ix = int(tx * 2) + int(j) - 1;
+            float val = 0.0;
+            if (iy >= 0 && iy < int(H) && ix >= 0 && ix < int(W))
+                val = inp[cin * H * W + uint(iy) * W + uint(ix)];
+            d[i * 4 + j] = val;
+        }
+    }
+
+    // 计算 temp = d @ B (4×4 @ 4×4 = 4×4)
+    // temp[i][n] = sum_{j=0}^3 d[i][j] * B[j][n]
+    float temp[16];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint n = 0; n < 4; ++n) {
+            float s = 0.0;
+            for (uint j = 0; j < 4; ++j)
+                s += d[i * 4 + j] * B[j * 4 + n];
+            temp[i * 4 + n] = s;
+        }
+    }
+
+    // 计算 V = BT @ temp (4×4 @ 4×4 = 4×4)
+    // V[i][j] = sum_{m=0}^3 BT[i][m] * temp[m][j]
+    float vout[16];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 4; ++j) {
+            float s = 0.0;
+            for (uint m = 0; m < 4; ++m)
+                s += BT[i * 4 + m] * temp[m * 4 + j];
+            vout[i * 4 + j] = s;
+        }
+    }
+
+    // 写入输出
+    uint out_base = cin * total_tiles * 16 + tid * 16;
+    for (uint k = 0; k < 16; ++k)
+        v[out_base + k] = vout[k];
+}

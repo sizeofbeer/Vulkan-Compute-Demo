@@ -1,0 +1,13 @@
+#version 450
+// 从 arena 的两个子区域读出 A、B，相加后写回第 3 个子区域，并同时写一份到独立输出 buffer 便于校验。
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Arena { float x[]; };          // 读 A、B，写 C（同一大 buffer）
+layout(std430, binding = 1) writeonly buffer Out { float o[]; };   // 独立输出（可直接读回 CPU）
+layout(push_constant) uniform PC { uint n; uint baseA; uint baseB; uint baseC; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+    float v = x[baseA + i] + x[baseB + i];
+    x[baseC + i] = v;     // 写回 arena 子区域
+    o[i] = v;             // 写独立输出供校验
+}

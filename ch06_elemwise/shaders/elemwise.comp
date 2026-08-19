@@ -1,0 +1,29 @@
+#version 450
+// 逐元素算子：对一个张量的每个元素独立做同一运算。计算量极小，却常常被显存带宽卡住。
+// 通过 mode 选择激活函数，避免为三个几乎一样的 kernel 重复写代码（顺便演示 push constant 传枚举）。
+//   mode 0: ReLU  = max(0,x)
+//   mode 1: GELU  = x * 0.5 * (1 + tanh(0.79788456*(x + 0.044715*x^3)))
+//   mode 2: SiLU  = x * sigmoid(x) = x / (1 + exp(-x))
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Inp { float x[]; };
+layout(std430, binding = 1) writeonly buffer Out { float y[]; };
+
+layout(push_constant) uniform PC { uint n; uint mode; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+    float v = x[i];
+    float r;
+    if (mode == 0u) {
+        r = (v > 0.0f) ? v : 0.0f;
+    } else if (mode == 1u) {
+        float c = 0.79788456f * (v + 0.044715f * v * v * v);
+        r = v * 0.5f * (1.0f + tanh(c));
+    } else {
+        r = v / (1.0f + exp(-v));
+    }
+    y[i] = r;
+}

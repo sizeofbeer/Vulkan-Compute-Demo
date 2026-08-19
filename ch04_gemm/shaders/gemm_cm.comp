@@ -1,0 +1,52 @@
+#version 450
+// Cooperative Matrix 矩阵乘 C = A * B，A: MxK, B: KxN, C: MxN
+// 使用 VK_KHR_cooperative_matrix 扩展，利用 Tensor Core / Matrix Core 硬件加速。
+//
+// 编译方式：glslc -DUSE_COOPMAT gemm_cm.comp -o gemm_cm.spv
+
+#extension GL_KHR_cooperative_matrix : require
+
+// 特化常量：tile 尺寸
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 2) buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint strideA;
+    uint strideB;
+    uint strideC;
+    uint K_total;
+};
+
+coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> fragA;
+coopmat<float, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> fragB;
+coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> fragC;
+
+void main() {
+    uint tileRow = gl_WorkGroupID.y * TILE_M;
+    uint tileCol = gl_WorkGroupID.x * TILE_N;
+
+    uint cOffset = tileRow * strideC + tileCol;
+    coopmatLoad(fragC, c, strideC, gl_CooperativeMatrixLayoutRowMajor, cOffset);
+
+    uint numTiles = (K_total + TILE_K - 1u) / TILE_K;
+    for (uint t = 0u; t < numTiles; ++t) {
+        uint k = t * TILE_K;
+
+        uint aOffset = tileRow * strideA + k;
+        coopmatLoad(fragA, a, strideA, gl_CooperativeMatrixLayoutRowMajor, aOffset);
+
+        uint bOffset = k * strideB + tileCol;
+        coopmatLoad(fragB, b, strideB, gl_CooperativeMatrixLayoutRowMajor, bOffset);
+
+        fragC = coopmatMulAdd(fragA, fragB, fragC);
+    }
+
+    coopmatStore(c, fragC, strideC, gl_CooperativeMatrixLayoutRowMajor, cOffset);
+}

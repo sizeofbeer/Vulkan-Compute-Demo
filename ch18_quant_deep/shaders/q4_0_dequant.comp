@@ -1,0 +1,78 @@
+#version 450
+// 独立 Q4_0 反量化内核
+// 将 Q4_0 格式的量化权重解压为 float32
+//
+// 输入：Q4_0 量化权重 buffer（每 block 5 uint，20 字节对齐）
+// 输出：float32 权重 buffer（K×N 个 float）
+//
+// 每个线程处理一个元素的解包+反量化
+//
+// 绑定：
+//   0: W_q4_0 (uint) — 量化权重
+//   1: W_f32 (float) — 输出 float32 权重
+//
+// Push constants: { K, N }
+//   K: 行数（输入特征维度）
+//   N: 列数（输出特征维度）
+//   总元素数 = K * N
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Wq   { uint wq[]; };
+layout(std430, binding = 1) writeonly buffer Wf32 { float wf32[]; };
+
+layout(push_constant) uniform PC {
+    uint K;
+    uint N;
+};
+
+const uint Q4_BLOCK_SIZE = 32u;
+const uint Q4_BLOCK_UINTS = 5u;
+
+// 手动 fp16 -> fp32 转换
+float fp16_to_fp32(uint bits) {
+    uint s = (bits >> 15u) & 0x1u;
+    uint e = (bits >> 10u) & 0x1Fu;
+    uint m = bits & 0x3FFu;
+    if (e == 0u) {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(m), -24);
+    } else if (e == 31u) {
+        return (m == 0u) ? (s != 0u ? -1.0/0.0 : 1.0/0.0) : 0.0/0.0;
+    } else {
+        return (s != 0u ? -1.0 : 1.0) * ldexp(float(0x400u | m), int(e) - 15 - 10);
+    }
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint totalElems = K * N;
+    if (idx >= totalElems) return;
+
+    // idx 对应权重矩阵中的位置 (k, n)
+    // 其中 k = idx / N, n = idx % N
+    uint k = idx / N;
+    uint n = idx % N;
+
+    // 计算 Q4_0 block 位置
+    uint blocksPerCol = (K + Q4_BLOCK_SIZE - 1u) / Q4_BLOCK_SIZE;
+    uint blockIdx = n * blocksPerCol + k / Q4_BLOCK_SIZE;
+    uint elemInBlock = k % Q4_BLOCK_SIZE;
+    uint blockStart = blockIdx * Q4_BLOCK_UINTS;
+
+    // 解包 scale (fp16)
+    uint scaleBits = wq[blockStart] & 0xFFFFu;
+    float scale = fp16_to_fp32(scaleBits);
+
+    // 解包 4-bit 数据（qs[] 起始于块内字节偏移 2，前 2 字节为 fp16 scale d）
+    uint byteIdx = elemInBlock / 2u;
+    uint nibbleShift = (elemInBlock & 1u) == 0u ? 0u : 4u;
+    uint byteOffset = 2u + byteIdx;             // 块内绝对字节偏移
+    uint wordIdx = byteOffset / 4u;
+    uint byteInWord = byteOffset % 4u;
+    uint word = wq[blockStart + wordIdx];
+    uint byteVal = (word >> (byteInWord * 8u)) & 0xFFu;
+    int q = int((byteVal >> nibbleShift) & 0xFu);
+    if (q >= 8) q = q - 16;
+
+    wf32[idx] = float(q) * scale;
+}

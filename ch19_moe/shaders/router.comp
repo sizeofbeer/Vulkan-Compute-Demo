@@ -1,0 +1,104 @@
+#version 450
+// ch19_moe/shaders/router.comp
+// MoE Router: Softmax over expert logits → top-k expert selection
+//
+// Each workgroup processes one token.
+// Uses subgroupAdd for the softmax reduction (warp-level parallel).
+// Uses shared memory for the top-k selection loop.
+//
+// Input:  router_logits  [num_tokens, num_experts]
+// Output: expert_indices [num_tokens, top_k]  (uint32)
+//         expert_weights [num_tokens, top_k]  (float32)
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer RouterLogits {
+    float logits[];
+};
+
+layout(std430, binding = 1) writeonly buffer ExpertIndices {
+    uint indices[];
+};
+
+layout(std430, binding = 2) writeonly buffer ExpertWeights {
+    float weights[];
+};
+
+layout(push_constant) uniform PC {
+    uint num_tokens;
+    uint num_experts;
+    uint top_k;
+};
+
+// Shared memory for top-k selection
+// The workgroup size (64) must be >= num_experts.
+shared float s_val[64];
+shared uint  s_idx[64];
+
+void main() {
+    // 每个 workgroup 处理一个 token，故 token = gl_WorkGroupID.x（不能用 gl_GlobalInvocationID.x，
+    // 后者包含组内线程偏移，会越界/错位）
+    uint tid = gl_WorkGroupID.x;          // token index
+    uint lid = gl_LocalInvocationID.x;    // local thread index within workgroup
+
+    if (tid >= num_tokens) return;
+
+    // ────────────────────────────────────────────────────────────
+    // Step 1: Load logit value (thread i handles expert i)
+    // ────────────────────────────────────────────────────────────
+    float v = (lid < num_experts)
+        ? logits[tid * num_experts + lid]
+        : -1e30f;  // neutral element for max
+
+    // ────────────────────────────────────────────────────────────
+    // Step 2: Softmax — compute exp(x - max) / sum(exp(x - max))
+    //          using subgroup-level reduction (no shared memory needed)
+    // ────────────────────────────────────────────────────────────
+    // 2a. Find row maximum (numerical stability)
+    float row_max = subgroupMax(v);
+
+    // 2b. exp(x - max)
+    float e = exp(v - row_max);
+    // Threads beyond num_experts contribute 0 to the sum
+    if (lid >= num_experts) e = 0.0f;
+
+    // 2c. Sum over all experts
+    float sum = subgroupAdd(e);
+
+    // 2d. Normalize
+    float softmax_val = (lid < num_experts) ? e / sum : 0.0f;
+
+    // ────────────────────────────────────────────────────────────
+    // Step 3: Store softmax values in shared memory for top-k selection
+    // ────────────────────────────────────────────────────────────
+    s_val[lid] = softmax_val;
+    s_idx[lid] = lid;
+    barrier();
+
+    // ────────────────────────────────────────────────────────────
+    // Step 4: Top-k selection (iterative maximum finding)
+    //          Only thread 0 does the selection loop; others wait at barrier.
+    //          This is O(k * num_experts) which is fine for small k & experts.
+    // ────────────────────────────────────────────────────────────
+    for (uint k = 0u; k < top_k; ++k) {
+        float best_val = -1.0f;
+        uint  best_idx = 0u;
+
+        if (lid == 0u) {
+            for (uint i = 0u; i < num_experts; ++i) {
+                if (s_val[i] > best_val) {
+                    best_val = s_val[i];
+                    best_idx = i;
+                }
+            }
+            // Write the selected expert index and weight
+            indices[tid * top_k + k] = best_idx;
+            weights[tid * top_k + k] = best_val;
+            // Mark as selected so it won't be chosen again
+            s_val[best_idx] = -1.0f;
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,41 @@
+#version 450
+// 直接卷积：对每个输出像素，遍历卷积核做乘加。这里是「教学最直白」版本（单输入通道、stride=1、same padding）。
+// 工业级会改成 im2col+GEMM（见同章 im2col.comp）或 Winograd，因为直接卷积访存不友好。
+
+layout(local_size_x = 16, local_size_y = 1) in;
+
+layout(std430, binding = 0) readonly buffer Inp { float inp[]; };  // Cin*H*W
+layout(std430, binding = 1) readonly buffer Wt  { float w[]; };    // Cout*Cin*K*K
+layout(std430, binding = 2) writeonly buffer Out { float outp[]; };// Cout*OH*OW
+
+layout(push_constant) uniform PC {
+    uint H;    // 输入高（=输出高，same padding + stride1）
+    uint W;    // 输入宽
+    uint K;    // 卷积核尺寸（奇数，如 3）
+    uint Cout;
+    uint Cin;  // 本教学版固定为 1
+};
+
+void main() {
+    uint ox  = gl_GlobalInvocationID.x;        // 输出列
+    uint idx = gl_GlobalInvocationID.y;        // 0 .. H*Cout-1
+    if (ox >= W) return;
+    uint oy = idx / Cout;
+    uint oc = idx % Cout;
+    if (oy >= H) return;
+
+    int pad = int(K) / 2;                       // K=3 -> pad=1
+    float acc = 0.0f;
+    for (uint cin = 0; cin < Cin; ++cin)
+        for (uint ky = 0; ky < K; ++ky)
+            for (uint kx = 0; kx < K; ++kx) {
+                int iy = int(oy) + int(ky) - pad;
+                int ix = int(ox) + int(kx) - pad;
+                float v = 0.0f;
+                if (iy >= 0 && iy < int(H) && ix >= 0 && ix < int(W))
+                    v = inp[cin * H * W + uint(iy) * W + uint(ix)];
+                acc += v * w[oc * Cin * K * K + cin * K * K + ky * K + kx];
+            }
+    uint OH = H, OW = W;
+    outp[oc * OH * OW + oy * OW + ox] = acc;
+}

@@ -1,0 +1,41 @@
+#version 450
+// im2col：把卷积的输入窗口「铺平」成列，从而把卷积变成一次矩阵乘。
+// 输出列矩阵 col：行 = 输出空间位置 p(=oy*OW+ox)，列 = 卷积核展开 q(=cin*K*K + ky*K + kx)。
+// 之后 C = col * W_reshape 就是卷积结果（见 gemm_naive.comp）。
+
+layout(local_size_x = 16, local_size_y = 1) in;
+
+layout(std430, binding = 0) readonly buffer Inp { float inp[]; };
+layout(std430, binding = 2) writeonly buffer Col { float col[]; };   // 输出绑在 binding=2，与 runConv 的 {0:in,1:wt,2:out} 约定对齐
+
+layout(push_constant) uniform PC {
+    uint H;    // 输入高
+    uint W;    // 输入宽
+    uint K;    // 核尺寸
+    uint Cin;
+    uint OW;   // 输出宽
+    uint OH;   // 输出高
+};
+
+void main() {
+    uint p = gl_GlobalInvocationID.x;            // 0 .. OH*OW-1
+    uint q = gl_GlobalInvocationID.y;            // 0 .. Cin*K*K-1
+    uint totalP = OH * OW;
+    uint totalQ = Cin * K * K;
+    if (p >= totalP || q >= totalQ) return;
+
+    uint ox  = p % OW;
+    uint oy  = p / OW;
+    uint cin = q / (K * K);
+    uint kq  = q % (K * K);
+    uint ky  = kq / K;
+    uint kx  = kq % K;
+
+    int pad = int(K) / 2;
+    int iy = int(oy) + int(ky) - pad;
+    int ix = int(ox) + int(kx) - pad;
+    float v = 0.0f;
+    if (iy >= 0 && iy < int(H) && ix >= 0 && ix < int(W))
+        v = inp[cin * H * W + uint(iy) * W + uint(ix)];
+    col[p * totalQ + q] = v;
+}

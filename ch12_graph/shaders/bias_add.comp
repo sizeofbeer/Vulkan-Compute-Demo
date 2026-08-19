@@ -1,0 +1,14 @@
+#version 450
+// 逐元素加偏置：out[i] = x[i] + b[i % n_bias]（偏置按列广播）。
+// 本应「融合」进前一个 matmul（ch06 讲过的融合动机），这里单独成一个节点，
+// 方便看清计算图里算子如何串接与加 barrier。
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint n; uint n_bias; uint pad1; uint pad2; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+    y[i] = x[i] + b[i % n_bias];
+}

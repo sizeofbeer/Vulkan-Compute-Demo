@@ -1,0 +1,10 @@
+#version 450
+// 往显存池（arena）的某个偏移处填一段已知数据，用来验证「从同一大 buffer 切分出的子区域」可用。
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Arena { float x[]; };   // 读写的整个池
+layout(push_constant) uniform PC { uint n; uint base; uint seed; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= n) return;
+    x[base + i] = float(i * 2u + seed);   // 可预期的模式，便于 CPU 校验
+}

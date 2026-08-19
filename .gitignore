@@ -1,0 +1,23 @@
+# ===== 构建产物 =====
+build/
+*.exe
+*.spv
+*.obj
+*.o
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.user
+*.swp
+
+# ===== 调试残留（已清理，双保险）=====
+minitest.cpp
+minitest2.cpp
+minitest*.exe
+mt2_*.exe
+empty_layers/
+
+# ===== 操作系统 / 杂项 =====
+Thumbs.db
+.DS_Store

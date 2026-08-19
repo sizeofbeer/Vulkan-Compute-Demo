@@ -1,0 +1,89 @@
+#version 450
+// Winograd 输出变换 F(2×2, 3×3)：Y = AT @ M @ A
+// 将 4×4 Winograd 域结果变换回 2×2 输出。
+//
+// A^T = [[1,  1,  1,  0],
+//        [0,  1, -1, -1]]
+//
+// A   = [[1,  0],
+//        [1,  1],
+//        [1, -1],
+//        [0, -1]]
+//
+// 每个工作组处理一个 tile 和一个 oc，4 个线程计算 2×2 输出。
+
+layout(local_size_x = 4) in;
+
+layout(std430, binding = 0) readonly buffer M  { float m[]; };   // total_tiles × Cout × 16
+layout(std430, binding = 2) writeonly buffer OutBuf { float outp[]; };// Cout × OH × OW
+
+layout(push_constant) uniform PC {
+    uint total_tiles;
+    uint Cout;
+    uint num_tiles_x;
+    uint OH;   // 输出高
+    uint OW;   // 输出宽
+    uint _pad0;
+};
+
+// A^T 矩阵 (2×4)
+const float AT[8] = float[](
+    1.0,  1.0,  1.0,  0.0,
+    0.0,  1.0, -1.0, -1.0
+);
+
+// A 矩阵 (4×2) = AT 的转置
+const float A[8] = float[](
+    1.0,  0.0,
+    1.0,  1.0,
+    1.0, -1.0,
+    0.0, -1.0
+);
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;   // tile ID
+    uint oc  = gl_GlobalInvocationID.y;   // 输出通道
+    if (tid >= total_tiles || oc >= Cout) return;
+
+    // 读取 4×4 M 矩阵
+    uint m_base = tid * Cout * 16 + oc * 16;
+    float M[16];
+    for (uint k = 0; k < 16; ++k)
+        M[k] = m[m_base + k];
+
+    // 计算 temp = AT @ M (2×4 @ 4×4 = 2×4)
+    // temp[i][n] = sum_{m=0}^3 AT[i][m] * M[m][n]
+    float temp[8]; // 2×4
+    for (uint i = 0; i < 2; ++i) {
+        for (uint n = 0; n < 4; ++n) {
+            float s = 0.0;
+            for (uint m = 0; m < 4; ++m)
+                s += AT[i * 4 + m] * M[m * 4 + n];
+            temp[i * 4 + n] = s;
+        }
+    }
+
+    // 计算 Y = temp @ A (2×4 @ 4×2 = 2×2)
+    // Y[i][j] = sum_{n=0}^3 temp[i][n] * A[n][j]
+    float Y[4]; // 2×2
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            float s = 0.0;
+            for (uint n = 0; n < 4; ++n)
+                s += temp[i * 4 + n] * A[n * 2 + j];
+            Y[i * 2 + j] = s;
+        }
+    }
+
+    // 写入 2×2 输出
+    uint oy0 = (tid / num_tiles_x) * 2;
+    uint ox0 = (tid % num_tiles_x) * 2;
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            uint oy = oy0 + i;
+            uint ox = ox0 + j;
+            if (oy < OH && ox < OW)
+                outp[oc * OH * OW + oy * OW + ox] = Y[i * 2 + j];
+        }
+    }
+}

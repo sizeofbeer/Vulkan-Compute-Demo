@@ -1,0 +1,42 @@
+#version 450
+// ch16_subgroup/shaders/softmax_smem.comp
+// 共享内存版 softmax，用于与 subgroup 版做性能对比
+// 与 ch08 的 softmax.comp 逻辑相同，使用共享内存树形归约
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Input  { float inp[]; };
+layout(std430, binding = 1) writeonly buffer Output { float outp[]; };
+
+layout(push_constant) uniform PC { uint N; };
+
+shared float smax[64];
+shared float ssum[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    // 1) 求行最大值
+    float v = (gid < N) ? inp[gid] : -1e30f;
+    smax[tid] = v;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) smax[tid] = max(smax[tid], smax[tid + s]);
+        barrier();
+    }
+    float m = smax[0];
+
+    // 2) exp(x - m) 并求和
+    float e = (gid < N) ? exp(inp[gid] - m) : 0.0f;
+    ssum[tid] = e;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) ssum[tid] += ssum[tid + s];
+        barrier();
+    }
+    float sum = ssum[0];
+
+    // 3) 归一化
+    if (gid < N) outp[gid] = e / sum;
+}

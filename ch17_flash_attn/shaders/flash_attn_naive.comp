@@ -1,0 +1,73 @@
+#version 450
+// 朴素注意力 kernel（单 kernel 内完成 3 步，用于对比验证）
+//
+// 与 flash_attn.comp 不同，本 kernel 先完整计算所有 N 个分数
+// S[q,k] = Q[q]·K[k]/sqrt(d)，然后做 softmax，最后累加 V。
+// 这需要 O(N) 寄存器/共享内存来存储分数，N 大时不可行——这正是
+// FlashAttention 要解决的问题。
+//
+// 每个工作组处理 1 个 query 行。
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer QBuf { float Q[]; };
+layout(std430, binding = 1) readonly buffer KBuf { float K[]; };
+layout(std430, binding = 2) readonly buffer VBuf { float V[]; };
+layout(std430, binding = 3) writeonly buffer OBuf { float O[]; };
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint d;
+    uint Br;
+    uint Bc;
+};
+
+shared float scores[1024];  // 最多支持 N=1024 的分数 tile（4 KB 共享内存）
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint q_idx = gl_WorkGroupID.x;
+
+    if (q_idx >= N) return;
+
+    float inv_sqrt_d = inversesqrt(float(d));
+
+    // 步骤 1：计算所有分数 S[q_idx, k] = Q[q_idx]·K[k] / sqrt(d)
+    // 每个线程算一个 key 的分数（N ≤ 128）
+    for (uint k = tid; k < N; k += 32u) {
+        float dot = 0.0f;
+        for (uint j = 0u; j < d; ++j) {
+            dot += Q[q_idx * d + j] * K[k * d + j];
+        }
+        scores[k] = dot * inv_sqrt_d;
+    }
+
+    barrier();
+
+    // 步骤 2：按行 softmax（安全 softmax）
+    // 求行最大值
+    if (tid == 0u) {
+        float m = -1e30f;
+        for (uint k = 0u; k < N; ++k) m = max(m, scores[k]);
+
+        float sum = 0.0f;
+        for (uint k = 0u; k < N; ++k) {
+            scores[k] = exp(scores[k] - m);
+            sum += scores[k];
+        }
+
+        // 归一化
+        for (uint k = 0u; k < N; ++k) scores[k] /= sum;
+    }
+
+    barrier();
+
+    // 步骤 3：计算上下文 O[q_idx, d] = Σ_k P[q_idx, k] * V[k, d]
+    for (uint j = tid; j < d; j += 32u) {
+        float acc = 0.0f;
+        for (uint k = 0u; k < N; ++k) {
+            acc += scores[k] * V[k * d + j];
+        }
+        O[q_idx * d + j] = acc;
+    }
+}

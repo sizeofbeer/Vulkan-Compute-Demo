@@ -1,0 +1,45 @@
+#version 450
+// Winograd 域逐元素乘加：M[oc] = sum_{cin} V[cin] ⊙ U[oc][cin]
+// 在 Winograd 域中对变换后的输入 tile 和滤波器 tile 做逐元素乘加。
+// 每个工作组处理一个 tile 和一个输出通道 oc。
+
+layout(local_size_x = 16) in;
+
+layout(std430, binding = 0) readonly buffer V  { float v[]; };   // Cin × total_tiles × 16
+layout(std430, binding = 1) readonly buffer U  { float u[]; };   // Cout × Cin × 16
+layout(std430, binding = 2) writeonly buffer M  { float m[]; };  // total_tiles × Cout × 16
+
+layout(push_constant) uniform PC {
+    uint total_tiles;
+    uint Cout;
+    uint Cin;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;   // tile ID
+    uint oc  = gl_GlobalInvocationID.y;   // 输出通道
+    if (tid >= total_tiles || oc >= Cout) return;
+
+    // 累加器：初始化为 0
+    float acc[16];
+    for (uint k = 0; k < 16; ++k) acc[k] = 0.0;
+
+    // 对每个输入通道 cin 做逐元素乘加
+    for (uint cin = 0; cin < Cin; ++cin) {
+        // V[tid][cin] 的起始位置
+        uint v_base = cin * total_tiles * 16 + tid * 16;
+        // U[oc][cin] 的起始位置
+        uint u_base = oc * Cin * 16 + cin * 16;
+
+        for (uint k = 0; k < 16; ++k)
+            acc[k] += v[v_base + k] * u[u_base + k];
+    }
+
+    // 写入输出
+    uint m_base = tid * Cout * 16 + oc * 16;
+    for (uint k = 0; k < 16; ++k)
+        m[m_base + k] = acc[k];
+}

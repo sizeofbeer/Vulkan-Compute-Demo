@@ -1,0 +1,1 @@
+add_chapter(ch01_vector_add)
