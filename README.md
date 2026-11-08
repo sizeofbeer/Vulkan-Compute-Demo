@@ -143,12 +143,12 @@ cmake --build build
 
 本课程每章都标注了对应的工业级实现。首版（2026-08-19）参考的三个仓库锚点已全部失效，本次按四个仓库的当前快照重新核对，并补入此前未纳入的 ncnn-compiler：
 
-| 仓库 | 本地路径 | 版本 / 提交 | 关键特性 |
-|------|----------|-------------|---------|
-| **ncnn** | `C:\msys64\home\14616\fork\NCNNs\ncnn` | `20261020-52-g00357e2f`（2026-11-08） | `src/layer/vulkan/shader/` 下 **17 个** `*_cm.comp`（GEMM/卷积/Winograd/SDPA/int8/bf16）；SDPA 家族 6 个 shader（FA / CM / 交叉注意力 / KV cache）；`get_optimal_cooperative_matrix_mnk()` 主机侧 MNK 选择；Reduction/归一化改用 **fp32 累加 + subgroup**；PipelineCache 可持久化；多队列 `acquire_queue/reclaim_queue` |
-| **ncnn-compiler** | `...\ncnn-compiler` | `867c6ab`（2026-10-31） | MLIR/LLVM AOT 编译器；`--backend=vulkan` 生成**模型专用 fixed-run** `.so` + C 头：SPIR-V 与权重内嵌、`create/run/destroy` 三段生命周期代码生成、静态图屏障、每次 run 重录命令缓冲；四 profile 终验（release / sanitize / offline / software；`run_gate.py` 另有 `hardware` 门禁变体），不支持动态 shape 与 CPU 回退 |
-| **ncnn-MoE-Runtime** | `...\ncnn-MoE-Runtime` | `63745f1`（2026-11-07，v0.1.0） | C++20 CPU/Vulkan 稀疏 MoE：**不可变执行图**、Expert 权重外置、ARC + Victim + Residency 缓存、HybridMode、BatchScheduler 多 Session / 投机解码；Qwen3 dense/MoE 等 8 类模型与 GGUF 导入；`src/kernels/vulkan/` 共 60 个 kernel（MXFP4 五件套、`router_select`、`expert_gather`、`moe_combine`…） |
-| **llama.cpp / ggml-vulkan** | `...\llama.cpp` | `a691b23`（2026-11-08） | 155 个 `.comp` 模板（另有 30 个 `.glsl` 公共片段）由 `vulkan-shaders-gen` + glslc 在**构建期**生成 SPIR-V（无预编译 `.spv`）；**44 种**量化类型（新增 Q1_0/Q2_0/TQ1_0/TQ2_0/MXFP4/NVFP4/F8_E4M3）；FA 拆成 `flash_attn_cm1/cm2/decode_phase_1/2/split_k_reduce/sparse_compact`；`ggml_vk_mul_mat_id` + `topk_moe/count_experts`；新增 WebGPU 后端 |
+| 仓库 | 版本 / 提交 | 关键特性 |
+|------|-------------|---------|
+| [**ncnn**](https://github.com/Tencent/ncnn) | `20261020-52-g00357e2f`（2026-11-08） | `src/layer/vulkan/shader/` 下 **17 个** `*_cm.comp`（GEMM/卷积/Winograd/SDPA/int8/bf16）；SDPA 家族 6 个 shader（FA / CM / 交叉注意力 / KV cache）；`get_optimal_cooperative_matrix_mnk()` 主机侧 MNK 选择；Reduction/归一化改用 **fp32 累加 + subgroup**；PipelineCache 可持久化；多队列 `acquire_queue/reclaim_queue` |
+| [**ncnn-compiler**](https://github.com/hqu-little-boy/ncnn-compiler) | `867c6ab`（2026-10-31） | MLIR/LLVM AOT 编译器；`--backend=vulkan` 生成**模型专用 fixed-run** `.so` + C 头：SPIR-V 与权重内嵌、`create/run/destroy` 三段生命周期代码生成、静态图屏障、每次 run 重录命令缓冲；四 profile 终验（release / sanitize / offline / software；`run_gate.py` 另有 `hardware` 门禁变体），不支持动态 shape 与 CPU 回退 |
+| [**ncnn-MoE-Runtime**](https://github.com/crafcat7/ncnn-MoE-Runtime) | `63745f1`（2026-11-07，v0.1.0） | C++20 CPU/Vulkan 稀疏 MoE：**不可变执行图**、Expert 权重外置、ARC + Victim + Residency 缓存、HybridMode、BatchScheduler 多 Session / 投机解码；Qwen3 dense/MoE 等 8 类模型与 GGUF 导入；`src/kernels/vulkan/` 共 60 个 kernel（MXFP4 五件套、`router_select`、`expert_gather`、`moe_combine`…） |
+| [**llama.cpp / ggml-vulkan**](https://github.com/ggml-org/llama.cpp) | `a691b23`（2026-11-08） | 155 个 `.comp` 模板（另有 30 个 `.glsl` 公共片段）由 `vulkan-shaders-gen` + glslc 在**构建期**生成 SPIR-V（无预编译 `.spv`）；**44 种**量化类型（新增 Q1_0/Q2_0/TQ1_0/TQ2_0/MXFP4/NVFP4/F8_E4M3）；FA 拆成 `flash_attn_cm1/cm2/decode_phase_1/2/split_k_reduce/sparse_compact`；`ggml_vk_mul_mat_id` + `topk_moe/count_experts`；新增 WebGPU 后端 |
 
 > 自 2026-08-19 首版以来，四个仓库分别新增 **147 / 106 / 192 / 1696** 次提交。下表给出「旧说法 → 现行」映射，各章 docs 的「工业级对照」已按现行路径、符号与特性清单同步。
 

@@ -127,7 +127,8 @@
 ### 第 2 步 · 全量构建（5 分钟）
 
 ```bash
-cd c:/msys64/home/14616/Vulkan-Compute-Demo
+git clone https://github.com/sizeofbeer/Vulkan-Compute-Demo.git
+cd Vulkan-Compute-Demo
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
