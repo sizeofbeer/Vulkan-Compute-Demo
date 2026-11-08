@@ -55,7 +55,7 @@ These answers all live in "device capabilities (device properties / features / l
 
 ## 0.6 Comparison with Industrial Implementations
 
-- **ncnn**: `VulkanDevice` probes `fp16` / `int8` / `subgroup_size` / `cooperative_matrix` and other capabilities once at initialization, and decides which kernel variants to load afterwards. This chapter is its "mini probing version."
-- **llama.cpp / ggml-vulkan**: `vk_device` also records `fp16`, `subgroup_size`, `max_workgroup_size`, `timestamp_period` at startup, and stores the results into `dev->device_vk` for all operators to query.
+- **ncnn**: `create_gpu_instance()` (`src/gpu.cpp`) creates the instance and `get_gpu_device()->info` (`GpuInfo`, `src/gpu.h`) probes fp16 / int8 / bf16 / subgroup / cooperative_matrix / cooperative_vector / float8 once; extension probing is `VulkanDevice::init_device_extension()`. These capability bits decide which kernel variants load later. This chapter is its "mini probing version."
+- **llama.cpp / ggml-vulkan**: device state now lives in `vk_device_struct` (`ggml-vulkan-types.h`, initialized in `ggml-vulkan.cpp`), recording fp16, subgroup size, workgroup limits, timestamp period, etc. The `vk-device.cpp` / `dev->device_vk` names from the first release no longer exist.
 
 In the next chapter (ch01) we will officially run our first operator — vector addition — and establish the main pipeline of "create buffer → upload → create pipeline → dispatch → read back."

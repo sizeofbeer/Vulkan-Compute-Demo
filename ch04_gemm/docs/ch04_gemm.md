@@ -43,7 +43,7 @@ pass.dispatch(cmd, &pc, sizeof(pc), gx, gy, 1);           // 录制 dispatch
 pass.destroy();                                           // 释放
 ```
 
-这直接对应 **ncnn 的 `VkCompute`**（它把 pipeline + descriptor + 一次 dispatch 封成一个对象）和 **llama.cpp 的 `vk_pipeline_wrapper`**。你之前在 ch01 手写的十几行建管线代码，现在一行搞定——但请记住它们背后还是那些 Vulkan 调用。
+这直接对应 **ncnn 的 `VkCompute`**（`record_pipeline()` 把 pipeline + descriptor + 一次 dispatch 录成一条记录）和 **llama.cpp 的 `vk_pipeline_struct`**（`ggml-vulkan-types.h`，由 `vk_pipeline` 智能指针持有；首版提到的 `vk_pipeline_wrapper` 已移除）。你之前在 ch01 手写的十几行建管线代码，现在一行搞定——但请记住它们背后还是那些 Vulkan 调用。
 
 分组数：`gx = ceil(N/16)`、`gy = ceil(M/16)`，因为工作组是 16×16。
 
@@ -132,6 +132,7 @@ passCM.prepareWithSpec(ctx, "gemm_cm.spv", bindings, pcs, specInfo.info);
 ## 4.7 对照工业级
 
 - **ncnn**：`gemm` 系列用 `optimal_local_size_xyz` 自动选工作组，并针对 ARM Mali / Adreno / 桌面 GPU 写了不同 tile 策略；还用 `elempack=4` 把 4 个元素打包进一个 vec4 进一步合并访存。
-- **llama.cpp / ggml-vulkan**：`mul_mm.comp` 按矩阵大小分 **large / medium / small** 三套 kernel；大矩阵用 cooperatice matrix（coopmat，相当于 Tensor Core），中小矩阵用手写 tiling；并通过 `vkCmdPushConstants` 传 M/N/K。
+- **llama.cpp / ggml-vulkan**：`mul_mm.comp` 按矩阵大小分 **large / medium / small** 三套 kernel；大矩阵用 cooperative matrix（coopmat，相当于 Tensor Core），中小矩阵用手写 tiling；并通过 `vkCmdPushConstants` 传 M/N/K。
+- **2026-11 同步**：ncnn `src/layer/vulkan/shader/`（单数目录）的 GEMM 家族已扩为 `gemm.comp` / `gemm_cm.comp` / `gemm_int8.comp` / `gemm_int8_cm.comp` / `gemm_sg.comp` / `gemm_quantize_{A,B}_int8.comp`；ggml `vulkan-shaders/` 提供 `mul_mm.comp` / `mul_mm_cm1.comp` / `mul_mm_cm2.comp` / `mul_mmq_cm1.comp`，155 个 `.comp` 模板在构建期由 glslc 生成 SPIR-V。
 
 下一章（ch05）我们把卷积拆成「直接卷积」和「im2col+GEMM」两条路，看清卷积为什么最终也变成 GEMM。

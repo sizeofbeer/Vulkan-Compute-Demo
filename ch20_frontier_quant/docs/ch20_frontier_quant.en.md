@@ -134,6 +134,66 @@ Our MXFP4 implementation is a simplified version of the OCP standard. The full O
 - **Grouping strategies**: Different granularities (per-tensor, per-row, per-block)
 - **Fused operations**: MXFP4 matrix multiplication can be directly implemented in hardware
 
+## Full ggml Quantization Landscape (synced 2026-11)
+
+`ggml/include/ggml.h` now defines `GGML_TYPE_COUNT = 44`; the first release's "20+ formats" and "frontier = K-quants + MXFP4" are no longer complete. Grouped by family:
+
+| Family | Types | Notes |
+|--------|-------|-------|
+| Float baselines | F32 / F16 / BF16 / F64 | Unquantized |
+| Integer | I8 / I16 / I32 / I64 | Mostly intermediate formats |
+| Basic blocks | Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1, **Q1_0 / Q2_0** | New 1-bit / 2-bit basics |
+| K-quants | Q2_K ~ Q6_K, Q8_K | This chapter's topic, still mainstream |
+| I-quants | IQ2_XXS/XS, IQ3_XXS/S, IQ1_S/M, IQ4_NL/XS | Vector quantization |
+| Ternary | **TQ1_0 / TQ2_0** | Ternary weights |
+| Microscaling FP4 | **MXFP4** (E8M0 scale) / **NVFP4** (E4M3 scale, 4 blocks) | This chapter implements MXFP4 |
+| FP8 | **F8_E4M3** | Used in mixed-precision schemes with FP4 |
+
+The matching Vulkan kernels are the 26 `ggml/src/ggml-vulkan/vulkan-shaders/dequant_<format>.comp`, with shared snippets in `dequant_funcs.glsl` / `dequant_funcs_cm2.glsl`; `llama-quant.cpp` exposes whole-model presets such as `GGML_FTYPE_MOSTLY_{MXFP4,NVFP4,Q1_0,F8_E4M3}`.
+
+> **Exercise (a runnable reference implementation now exists, see below)**: replace this chapter's MXFP4 E8M0/fp16 scale with NVFP4's E4M3 scale and compare errors for identical E2M1 weights — the most direct difference between today's two industrial 4-bit formats. ncnn-MoE-Runtime has also caught up with BF16 / FP8 E4M3 / INT4 / INT8 / MXFP4 / Qn_K and five dedicated MXFP4 kernels (see ch19).
+
+## NVFP4: Two-Level E4M3 Scales (Advanced Implementation)
+
+`ch20_nvfp4` (`main_nvfp4.cpp` + `shaders/nvfp4_gemm.comp`) is the runnable reference implementation of the exercise above, and the code added after syncing the four reference repositories. It is a separate executable target and does not touch `main.cpp`.
+
+| Format | Values | Scale granularity | Scale format | Teaching layout | Bitrate |
+|--------|--------|-------------------|--------------|-----------------|---------|
+| MXFP4 (simplified OCP) | E2M1 | 32 elements | 1 × fp16 | 20 bytes / 32 elements | 5 bpe |
+| NVFP4 (this demo) | E2M1 | 16 elements + shared global over 64 | 4 × E4M3 + 1 × fp16 | 40 bytes / 64 elements | 5 bpe |
+
+Both formats have the **same bitrate**, so the comparison isolates "scale granularity + scale precision" without mixing in a compression-ratio difference.
+
+### Data layout (super-block, 40 bytes = 10 × uint32)
+
+```
+bytes 0..1  : fp16 global scale
+bytes 2..5  : 4 × uint8 E4M3 micro-block scales
+bytes 6..7  : padding (alignment)
+bytes 8..39 : 64 × 4-bit E2M1 values (2 per byte)
+```
+
+- Dequantize: `w = E2M1_decode(code) × E4M3_decode(scale[micro]) × global`.
+- Quantize: take `global = maxAbs / 448` (the E4M3 maximum) over each 64-element super-block, then for each 16-element micro-block compute `scale = maxAbs / (6 × global)` and encode it as E4M3 (E2M1 max is 6).
+- The CPU side always dequantizes with the **actually stored** fp16 / E4M3 values so it matches the GPU shader bit-for-bit — the key to passing fused-dequant GEMM verification.
+
+### Measured (M=256, K=512, N=256, GTX 1080 Ti)
+
+| Metric | MXFP4 | NVFP4 |
+|--------|-------|-------|
+| Storage | 81,920 bytes / 5.00 bpe | 81,920 bytes / 5.00 bpe |
+| Weight quantization RMSE | 0.06139 | **0.05806** |
+| GEMM output RMSE (vs FP32) | 0.79804 | **0.75860** |
+| GPU fused GEMM vs CPU reference | 0 errors, RMSE 1.46e-6 | 0 errors, RMSE 1.46e-6 |
+
+NVFP4 is slightly better (~5%), but the gain is **not dramatic**: finer 16-element granularity reduces in-block dynamic range, at the cost of quantizing the E4M3 scale itself and accumulating error in both scaling levels. Real Blackwell NVFP4 also pairs the format with calibration algorithms and hardware FP4 Tensor Cores; this demo only shows the format difference. See ggml's `dequant_nvfp4.comp` / `GGML_TYPE_NVFP4` and `llama-quant.cpp`'s `GGML_FTYPE_MOSTLY_NVFP4` for production code.
+
+### Try it
+
+1. Change the micro-block from 16 to 8 (twice as many scales, layout must be rearranged) and observe RMSE vs bitrate
+2. Replace E4M3 with E5M2 and compare scale dynamic range against accuracy
+3. Add a per-channel global scale to both formats and inspect errors on long-tail weights
+
 ## The Future of Quantization
 
 ### 4-bit and Below

@@ -1,0 +1,53 @@
+#version 450
+// ch19_moe/shaders/expert_gemm_sparse.comp
+// 稀疏 MoE 第 3 步：只计算「真正被路由到的 (token, expert) 对」。
+//
+// 每个 workgroup 处理一个 slot：
+//   t = gather_token[slot], e = gather_expert[slot]
+//   partial[slot, d] = Σ_k act[t, k] * W[e, k, d]
+//
+// 与 dense 版 `expert_gemm.comp` 的区别：
+//   dense : num_experts × num_tokens 行，无论该 token 是否选中该专家都要算
+//   sparse: total_entries = num_tokens × top_k 行，只算被选中的
+//
+// 注意：这里仍把 token 激活行放进 shared memory 复用。若每个线程都各自去全局
+// 内存重读整行，稀疏版反而会被访存拖慢（实测加速比接近 1x）——这正是工业实现
+// 里 expert_gather 之后必须接 tiled / coopmat GEMM 的原因。dim 上限 256。
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Act          { float act[];           };
+layout(std430, binding = 1) readonly buffer ExpertWeights{ float wt[];            };
+layout(std430, binding = 2) readonly buffer GatherToken  { uint gather_token[];   };
+layout(std430, binding = 3) readonly buffer GatherExpert { uint gather_expert[];  };
+layout(std430, binding = 4) writeonly buffer Partial     { float partial[];       };
+
+layout(push_constant) uniform PC {
+    uint dim;           // hidden_dim，既是 K 也是 N
+    uint total_slots;   // = num_tokens * top_k
+};
+
+shared float s_act[256];
+
+void main() {
+    uint slot = gl_WorkGroupID.x;
+    uint lid  = gl_LocalInvocationID.x;
+    if (slot >= total_slots || dim > 256u) return;
+
+    uint t      = gather_token[slot];
+    uint e      = gather_expert[slot];
+    uint wtBase = e * dim * dim;
+
+    // 该 token 的激活行只读一次，供所有输出列复用
+    for (uint k = lid; k < dim; k += 64u) s_act[k] = act[t * dim + k];
+    barrier();
+
+    // 每个线程负责若干输出列；同一 k 下相邻线程读连续权重，合并访存
+    for (uint d = lid; d < dim; d += 64u) {
+        float acc = 0.0f;
+        for (uint k = 0u; k < dim; ++k) {
+            acc += s_act[k] * wt[wtBase + k * dim + d];
+        }
+        partial[slot * dim + d] = acc;
+    }
+}

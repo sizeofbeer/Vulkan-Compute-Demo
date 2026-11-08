@@ -42,6 +42,7 @@ O = P · V              # 上下文，O ∈ ℝ^{N×D}
   - NVIDIA 专属的 **coopmat2** 路径。
   共同目标是「不把 N×N 分数矩阵写回显存」。本章的 3-kernel 版本正是不做此优化的「朴素注意力」，便于理解。
 - **ncnn**：CV 模型里注意力（如 ViT、MobileViT）同样拆成 matmul+softmax+matmul，并尽量融合。
+- **2026-11 同步**：工业级 FlashAttention 已不是「一个 `flash_attn.comp`」。ncnn `shader/` 下有 `sdpa_fa.comp` / `sdpa_fa_cm.comp` / `sdpa_cross*.comp` / `sdpa_kvcache_{append,copy}.comp`；ggml `vulkan-shaders/` 下有 `flash_attn{,_cm1,_cm2}.comp`、`flash_attn_decode_phase_{1,2}.comp`、`flash_attn_split_k_reduce.comp`、`flash_attn_sparse_compact.comp`。prefill 与 decode 分开成不同 kernel 是当前的主流做法，详见 ch17。
 
 ## 8.6 FlashAttention 融合 kernel
 

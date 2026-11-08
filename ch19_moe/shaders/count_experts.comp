@@ -1,0 +1,56 @@
+#version 450
+// ch19_moe/shaders/count_experts.comp
+// 稀疏 MoE 第 1 步：统计每个专家被路由到的 (token, top-k) 条目数，
+// 并在 GPU 上完成 prefix sum，为 gather 生成紧凑区间
+//   expert e 占用槽位 [offsets[e], offsets[e] + counts[e])
+//
+// 对应工业实现：ggml `topk_moe.comp` + `count_experts.comp`、
+//               ncnn-MoE-Runtime `graph/router.h::forward_router()` 生成的 ExpertDispatchPlan。
+//
+// Input : indices[total_entries]   —— router 选出的专家编号
+// Output: counts[num_experts]      —— 每专家的条目数
+//         offsets[num_experts]     —— prefix sum（该专家槽位起点）
+//         cursor[num_experts]      —— 初值 = offsets，gather 阶段用 atomicAdd 递增
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Indices { uint indices[]; };
+layout(std430, binding = 1) writeonly buffer Counts  { uint counts[];  };
+layout(std430, binding = 2) writeonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 3) writeonly buffer Cursor  { uint cursor[];  };
+
+layout(push_constant) uniform PC {
+    uint total_entries;   // num_tokens * top_k
+    uint num_experts;
+};
+
+// 单个 workgroup 内用 shared atomic 计数，避免跨 workgroup 的全局同步。
+// num_experts <= 64（本教学 demo 中为 8）。
+shared uint s_counts[64];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+
+    if (lid < num_experts && lid < 64u) s_counts[lid] = 0u;
+    barrier();
+
+    // 每个线程处理一个或多个条目；单 workgroup 即可覆盖任意 total_entries
+    for (uint entry = lid; entry < total_entries; entry += 64u) {
+        uint e = indices[entry];
+        if (e < 64u) atomicAdd(s_counts[e], 1u);
+    }
+    barrier();
+
+    if (lid < num_experts && lid < 64u) counts[lid] = s_counts[lid];
+
+    // prefix sum（专家数很小，串行即可；工业实现用 GPU scan）
+    if (lid == 0u) {
+        uint off = 0u;
+        for (uint e = 0u; e < num_experts; ++e) {
+            uint c = (e < 64u) ? s_counts[e] : 0u;
+            offsets[e] = off;
+            cursor[e]  = off;
+            off += c;
+        }
+    }
+}

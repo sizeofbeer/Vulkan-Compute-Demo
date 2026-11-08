@@ -223,33 +223,38 @@ ctx.physical.getCooperativeMatrixPropertiesKHR(&propCount, props.data());
 
 ### 15.7.3 Production Practice
 
-**ncnn**: uses `gemm_cm.comp` as the CM path, falling back to `gemm_tiled.comp`. It queries `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` to find supported tile sizes and selects optimal parameters for each hardware target.
+**ncnn**: the shader directory is `src/layer/vulkan/shader/` (**singular**); the CM path is `gemm_cm.comp`, with scalar fallbacks `gemm.comp` / `gemm_sg.comp`. Host-side tile selection is wrapped in `VulkanDevice::get_optimal_cooperative_matrix_mnk(..., coopmat_acctype)` (`src/gpu.h`), driven by `Option::use_cooperative_matrix` (enabled by default) and the `GpuInfo` capability bits.
 
-**llama.cpp / ggml-vulkan**: `mul_mm_cm2.comp` is the preferred path for large matrices. For small matrices, it uses `mul_mm.comp` (traditional tiling). It also leverages `VK_EXT_cooperative_matrix_maintenance1`'s flexible dimensions for more adaptable tile selection.
+**llama.cpp / ggml-vulkan**: `vulkan-shaders/mul_mm_cm2.comp` is still the CM2 (incl. decode vector) main path; small matrices use `mul_mm.comp`. New additions include `mul_mmq_cm1.comp` and CM1/CM2 `conv2d/conv3d`. All 155 `.comp` templates are turned into SPIR-V at build time by `vulkan-shaders-gen` + glslc — there are no prebuilt `.spv` files.
 
 ---
 
 ## 15.8 Comparison with Production Implementations
 
-### 15.8.1 ncnn's gemm_cm.comp
+### 15.8.1 ncnn's gemm_cm.comp (as of 2026-11)
 
-Key features of ncnn's CM implementation:
-- Uses `#extension GL_NV_cooperative_matrix : enable` (early versions) or `GL_KHR_cooperative_matrix`
-- Supports FP16 and INT8 CM paths
-- Uses `elempack=4` packing to reduce memory access
-- Automatically selects tile sizes via `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`
-- Fallback and CM paths share the same pipeline selection logic
+- Path: `ncnn/src/layer/vulkan/shader/gemm_cm.comp`; the directory holds **17** `*_cm.comp` shaders covering GEMM, convolution/deconvolution, Winograd transforms and GEMM, 1D convolution, SDPA and cross-attention.
+- Both KHR and NV coopmat paths are retained, with `UNROLL_SG/WG` macros controlling tile unrolling; recent fixes cover Adreno/Mali `coopMatLoad/Store` strides and four-row matrices.
+- Data types extend from FP16 to **BF16 and INT8** (`gemm_int8_cm.comp`, `convolution_*_int8_cm.comp`); fp32 accumulation is explicit (`get_optimal_cooperative_matrix_mnk` also returns `coopmat_acctype`).
+- Shared-memory padding was removed from the CM shader after measurements showed the unpadded variant is faster; `elempack=4` and int8 pack4 rules are documented in `docs/developer-guide/glsl-extension.md`.
 
-### 15.8.2 ggml's mul_mm_cm2.comp
+### 15.8.2 ggml's mul_mm_cm2.comp (as of 2026-11)
 
-Key features of ggml's CM implementation:
-- Optimized specifically for large matrices (≥ 1024)
-- Uses the `VK_KHR_cooperative_matrix` extension
-- Supports FP16, BF16 data types
-- Controls subgroup size via `VK_EXT_subgroup_size_control` to match CM requirements
-- Shares buffer management with traditional `mul_mm.comp` but uses a different pipeline
+- Path: `ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp`; `mul_mm_id_funcs.glsl` and `dequant_funcs_cm2.glsl` handle unpacking under CM2.
+- Supports `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`, `VK_EXT_cooperative_matrix_maintenance1` and subgroup size control.
+- Quantization coverage grew to 44 types (MXFP4 / NVFP4 / Q1_0 / Q2_0 / TQ / F8_E4M3 included); the CM2 path cooperates with the `dequant_*` shaders.
+- Device/pipeline structures live in `ggml-vulkan-types.h`; `vk-device.cpp`, `pipeline.cpp` and `vk_pipeline_wrapper` are gone.
 
-### 15.8.3 This Chapter's Approach
+### 15.8.3 New Capabilities Worth Trying (synced 2026-11)
+
+| Capability | ncnn | ggml |
+|------------|------|------|
+| bf16 / int8 coopmat | `gemm_int8_cm.comp`, bf16 packed GEMM | `dequant_*` + CM1/CM2 quantized paths |
+| Maintenance extensions | `VK_EXT_cooperative_matrix_maintenance1`, `VK_NV_cooperative_matrix2`, cooperative vector, float8, OCP microscaling | same + `mul_mmq_cm1.comp` |
+| Accumulation precision | Reduction switched to fp32 accumulation (2026-11 #7247) | fp32 accumulation in FA decode |
+| Host-side shape selection | `get_optimal_cooperative_matrix_mnk()` returns M/N/K/subgroup size/acctype | shape-specialized pipelines generated at build time |
+
+### 15.8.4 This Chapter's Approach
 
 This chapter's `gemm_cm.comp` includes both a CM path and a fallback path:
 - **CM path**: uses a single `cooperativeMatrixMulAdd` instruction for matrix multiply, executed by Tensor Core hardware

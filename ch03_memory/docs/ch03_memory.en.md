@@ -60,7 +60,7 @@ This chapter's `fp16_roundtrip.comp` demonstrates: the input buffer is declared 
 
 ## 3.6 Industrial-grade comparison
 
-- **ncnn**: explicitly distinguishes three allocators — `VkBlobAllocator` (16MB pool, holds activations, device-local), `VkWeightAllocator` (weights resident in device-local), `VkStagingAllocator` (host-visible relay). Weights are uploaded only once at model load time.
-- **llama.cpp / ggml-vulkan**: at model load, map weights into device-local; during inference, inputs/outputs go through staging; and it selects the optimal upload path via the memory properties recorded by `dev->device_vk`.
+- **ncnn**: three allocators in `src/allocator.h` — `VkBlobAllocator` (`preferred_block_size` defaults to 16MB, activations), `VkWeightAllocator` (8MB, resident weights), `VkStagingAllocator` (host-visible relay); all allocate via `fastMalloc()`. Weights are uploaded once at model load time.
+- **llama.cpp / ggml-vulkan**: weights are mapped into device-local at load; inputs/outputs use staging at inference; memory properties live in `vk_device_struct` (`ggml-vulkan-types.h`). The old `dev->device_vk` field no longer exists.
 
 Next chapter (ch04) we finally enter the core operation of neural networks — **matrix multiplication GEMM**, and for the first time seriously use "shared memory" and "coalesced access".

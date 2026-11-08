@@ -43,7 +43,7 @@ pass.dispatch(cmd, &pc, sizeof(pc), gx, gy, 1);           // record dispatch
 pass.destroy();                                           // release
 ```
 
-This directly corresponds to **ncnn's `VkCompute`** (which wraps pipeline + descriptor + one dispatch into a single object) and **llama.cpp's `vk_pipeline_wrapper`**. The dozen-plus lines of pipeline-building code you wrote by hand in ch01 are now done in one line — but remember that those Vulkan calls are still underneath.
+This directly corresponds to **ncnn's `VkCompute`** (`record_pipeline()` records pipeline + descriptors + one dispatch as one deferred record) and **llama.cpp's `vk_pipeline_struct`** (`ggml-vulkan-types.h`, held by the `vk_pipeline` shared pointer; the `vk_pipeline_wrapper` name from the first release is gone). The dozen-plus lines of pipeline-building code you wrote by hand in ch01 are now done in one line — but remember that those Vulkan calls are still underneath.
 
 Number of workgroups: `gx = ceil(N/16)`, `gy = ceil(M/16)`, since the workgroup is 16×16.
 
@@ -133,5 +133,6 @@ On Tensor Core-capable hardware, the CM path typically achieves 2-5x speedup. Tr
 
 - **ncnn**: the `gemm` family uses `optimal_local_size_xyz` to auto-select the workgroup, and writes different tile strategies for ARM Mali / Adreno / desktop GPUs; it also uses `elempack=4` to pack 4 elements into one vec4 for further coalesced access.
 - **llama.cpp / ggml-vulkan**: `mul_mm.comp` dispatches **large / medium / small** kernels by matrix size; large matrices use cooperative matrix (coopmat, equivalent to Tensor Core), small/medium matrices use hand-written tiling; M/N/K are passed via `vkCmdPushConstants`.
+- **Synced 2026-11**: ncnn's GEMM family in `src/layer/vulkan/shader/` (singular) now includes `gemm.comp` / `gemm_cm.comp` / `gemm_int8.comp` / `gemm_int8_cm.comp` / `gemm_sg.comp` / `gemm_quantize_{A,B}_int8.comp`; ggml's `vulkan-shaders/` offers `mul_mm.comp` / `mul_mm_cm1.comp` / `mul_mm_cm2.comp` / `mul_mmq_cm1.comp`, with all 155 `.comp` templates compiled to SPIR-V by glslc at build time.
 
 In the next chapter (ch05) we break convolution into two paths, "direct convolution" and "im2col+GEMM", to see clearly why convolution also ultimately becomes a GEMM.

@@ -50,7 +50,7 @@ cmd.bindPipeline(..., p2); cmd.pushConstants(...); cmd.dispatch(...);   // 读 b
 
 ## 2.5 对照工业级
 
-- **ncnn** 的 `VkCompute` 内部就维护着 `pending_dispatch_total` 和 `delayed_records`，它会**自动在你录制下一个算子前插入正确的 barrier**——调用者从不需要手写 `pipelineBarrier`。本章程的「手写 barrier」正是为了让你理解 ncnn 替你做了什么。
+- **ncnn** 的 `VkCompute` 内部维护 `delayed_records` 与 `pending_dispatch_total()`：`record_pipeline()` 只负责录制，`submit_and_wait()` 一次性提交并**按依赖自动插入 barrier**——调用者从不需要手写 `pipelineBarrier`。本章的「手写 barrier」正是为了让你理解 ncnn 替你做了什么。（首版文档写的 `VkCompute::dispatch()` 不是公开 API；`dispatch` 只出现在 `command.cpp` 内部的 `vkCmdDispatch` 调用里。）
 - **llama.cpp** 在 AMD 设备上曾专门补过 `buffer ownership transfer` 的 barrier（因为队列/内存所有权切换需要额外同步）。同步是 Vulkan 推理最容易踩坑的地方，务必在这里吃透。
 
 下一章（ch03）讲 **显存管理**：为什么 `vkUpload` 在 device-local 时要走 staging 中转？`HOST_VISIBLE / DEVICE_LOCAL / COHERENT` 到底差在哪？以及 FP16 怎么存进 buffer。

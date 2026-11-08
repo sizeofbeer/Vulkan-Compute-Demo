@@ -52,7 +52,7 @@ The weight pool is **never reset** — this is exactly the engineering realizati
 
 ## 10.6 Comparing with industry-grade
 
-- **ncnn**: `VkBlobAllocator` maintains a 16MB device-local pool; blob allocate/free all happen inside the pool; `VkWeightAllocator` stores weights separately and marks them resident; both reuse as much as possible to avoid moving weights back and forth.
-- **llama.cpp / ggml-vulkan**: `ggml_arena` reuses one big buffer for all temporary tensors on each `ggml_graph_compute`; `ggml_free` only rolls the pointer back; model weights (after dequantization) stay resident in device-local and are not allocated per frame.
+- **ncnn**: `VkBlobAllocator` keeps a device-local pool sized by `preferred_block_size` (16MB default); `fastMalloc()` carves aligned blocks out of it and reuses them. `VkWeightAllocator` (8MB default) keeps weights resident and `VkStagingAllocator` handles host-visible transfers. `PipelineCache::save_cache()/load_cache()` can persist compiled pipelines across processes.
+- **llama.cpp / ggml-vulkan**: `ggml_backend_vk_graph_compute()` (see ch12) reuses large buffers for the whole graph's temporary tensors, with structures in `ggml-vulkan-types.h`; weights stay resident in device-local and are not allocated per frame. The `ggml_arena` / `ggml_free` / `dev->device_vk` names from the first release no longer exist.
 
 Next chapter (ch11) we **fuse dequantization in place** inside matmul — weights are stored as int8 (4× memory saved), and the GPU restores them to float on read before accumulating. This is the core technique for saving memory in LLM inference.

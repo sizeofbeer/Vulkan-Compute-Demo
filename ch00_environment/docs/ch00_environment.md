@@ -55,7 +55,7 @@ Vulkan 是「显式」的 API：它不会替你判断设备能力，也不会在
 
 ## 0.6 对照工业级
 
-- **ncnn**：`VulkanDevice` 在初始化时一次性探测 `fp16` / `int8` / `subgroup_size` / `cooperative_matrix` 等能力，并据此决定后续加载哪套 kernel 变体。本章就是它的「迷你探测版」。
-- **llama.cpp / ggml-vulkan**：`vk_device` 同样在启动时记录 `fp16`、`subgroup_size`、`max_workgroup_size`、`timestamp_period`，并把结果存进 `dev->device_vk` 供所有算子查询。
+- **ncnn**：`create_gpu_instance()`（`src/gpu.cpp`）建实例，`get_gpu_device()->info`（`GpuInfo`，`src/gpu.h`）一次性探测 fp16 / int8 / bf16 / subgroup / cooperative_matrix / cooperative_vector / float8 等能力；扩展探测为 `VulkanDevice::init_device_extension()`，能力位决定后续加载哪套 kernel 变体。本章就是它的「迷你探测版」。
+- **llama.cpp / ggml-vulkan**：设备状态收敛到 `ggml-vulkan-types.h` 的 `vk_device_struct`（在 `ggml-vulkan.cpp` 初始化），记录 fp16、subgroup size、workgroup 上限、timestamp period 等。首版提到的 `vk-device.cpp` / `dev->device_vk` 已不存在。
 
 下一章（ch01）我们正式跑通第一条算子——向量加法，建立「建 buffer → 上传 → 建管线 → dispatch → 读回」的主链路。

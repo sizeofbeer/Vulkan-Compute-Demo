@@ -3,6 +3,8 @@
 > 本文档是仓库的"使用说明 + 设计哲学"合并读本。目标读者：准备学这套 21 章课程、想理解**为什么这么编排**、以及**怎么开始**的人。
 >
 > 读完本文档，你应该能：判断先学哪几章、跳过哪几章、之后翻工业代码时该去哪一份对照。
+>
+> **2026-11-08 同步**：第 7 节的「读源码导航表」与全课程 docs 已按 ncnn `20261020-52-g00357e2f`、ncnn-compiler `867c6ab`、ncnn-MoE-Runtime `63745f1`、llama.cpp `a691b23` 重新核对；旧版的 `init_device()` / `VkCompute::dispatch()` / `vk-device.cpp` / `iq-quants.c` / `ExpertDispatcher` 等导航均已修正。版本对照与完整新旧映射见 `README.md` 第 4 节。
 
 ---
 
@@ -172,29 +174,29 @@ cmake --build build --target ch01_vector_add   # 自动 recompile .comp
 
 每一章的「一句话获得」与「对照工业代码」：
 
-| # | 主题 | 一句话获得 | 对照工业代码 |
+| # | 主题 | 一句话获得 | 对照工业代码（2026-11 现行） |
 |---|------|------------|-------------|
-| **ch00** | 环境探测 | 拿到你的设备能力报告 | ncnn `VulkanDevice::init`、ggml `vk_device::init` |
+| **ch00** | 环境探测 | 拿到你的设备能力报告 | ncnn `create_gpu_instance()` + `get_gpu_device()->info`；ggml `vk_device_struct` |
 | **ch01** | 向量加法 | 跑通第一条 GPU 算子 | 最小 kernel（无直接对应） |
-| **ch02** | fence / barrier | 解决 GPU 写后读 hazard | ncnn `VkCompute::submit_and_wait` |
-| **ch03** | 显存管理 | 理解 device-local / host-visible / staging | ncnn `VkStagingAllocator` |
-| **ch04** | GEMM | tile + 共享内存 + 时间戳 | ncnn / llama matmul 核心 |
-| **ch05** | 卷积 | 直接 / im2col+GEMM / Winograd F(2×2,3×3) | ncnn 卷积族 |
+| **ch02** | fence / barrier | 解决 GPU 写后读 hazard | ncnn `VkCompute::record_pipeline()` → `submit_and_wait()` |
+| **ch03** | 显存管理 | 理解 device-local / host-visible / staging | ncnn `VkStagingAllocator::fastMalloc()` |
+| **ch04** | GEMM | tile + 共享内存 + 时间戳 | ncnn `shader/gemm.comp` / `gemm_cm.comp` / `gemm_sg.comp` |
+| **ch05** | 卷积 | 直接 / im2col+GEMM / Winograd F(2×2,3×3) | ncnn `convolution_vulkan.cpp` + `shader/convolution_*winograd*.comp` |
 | **ch06** | 逐元素算子 | ReLU / GELU / SiLU + 融合动机 | 激活融合 |
-| **ch07** | RMSNorm | 工作组内共享内存归约 | Transformer 归一化 |
+| **ch07** | RMSNorm | 工作组内共享内存归约 | ncnn `shader/reduction.comp`（fp32 累加 + subgroup） |
 | **ch08** | 简化注意 | 数值稳定 softmax + 3-kernel attn | （ch17 FlashAttn 铺垫） |
 | **ch09** | 性能分析 | GPU timestamp + Roofline | 算子级 profiling |
-| **ch10** | 显存池 | `DeviceArena` bump 分配器 + 权重常驻 | ncnn `VkBlobAllocator` |
-| **ch11** | 量化 | int8 / Q4_0 / Q8_0 + 融合反量化 GEMM | llama.cpp `dequant_funcs` |
-| **ch12** | 计算图 | 多算子录一条命令 + 自动 barrier | ggml 计算图 |
+| **ch10** | 显存池 | `DeviceArena` bump 分配器 + 权重常驻 | ncnn `VkBlobAllocator`（16MB 池）/ `VkWeightAllocator`（8MB） |
+| **ch11** | 量化 | int8 / Q4_0 / Q8_0 + 融合反量化 GEMM | ggml `dequant_funcs.glsl` + `ggml-quants.c` |
+| **ch12** | 计算图 | 多算子录一条命令 + 自动 barrier | ggml `ggml_backend_vk_graph_compute()`；ncnn-compiler fixed-run AOT |
 | **ch13** | 综合 MLP | 权重常驻 + GEMM+bias+ReLU+图 | 完整推理引擎雏形 |
 | **ch14** | LLM 引擎 | Qwen3-0.6B 端到端 CPU 自回归 | 数值 ground truth |
-| **ch15** | CoopMat | `coopmatMulAdd`、Tensor Core 编程 | ncnn `gemm_cm.comp` / ggml `mul_mm_cm2.comp` |
-| **ch16** | Subgroup | shuffle / broadcast / ballot / warp-softmax | ncnn / ggml subgroup 优化 |
-| **ch17** | FlashAttn | 在线 softmax + 分块 + 融合 kernel | ncnn `sdpa_fa.comp` / ggml `flash_attn.comp` |
-| **ch18** | 量化深入 | Q4_0 / Q8_0 block-wise + 融合 GEMM | ggml `dequant_funcs` |
-| **ch19** | MoE | Router top-k + Expert dispatch + Combine | ncnn-MoE-Runtime / ggml `MUL_MAT_ID` |
-| **ch20** | K-quant | Q2_K ~ Q6_K super-block + MXFP4 E2M1 | ggml 最新量化格式 |
+| **ch15** | CoopMat | `coopmatMulAdd`、Tensor Core 编程 | ncnn 17 个 `*_cm.comp` / ggml `mul_mm_cm2.comp` |
+| **ch16** | Subgroup | shuffle / broadcast / ballot / warp-softmax | ncnn `reduction.comp` / ggml `flash_attn*.comp` |
+| **ch17** | FlashAttn | 在线 softmax + 分块 + 融合 kernel + KV cache 两阶段 decode demo | ncnn `sdpa_fa{,_cm}.comp` / ggml `flash_attn{,_cm1,_cm2,decode_phase_*,split_k_reduce}.comp` |
+| **ch18** | 量化深入 | Q4_0 / Q8_0 block-wise + 融合 GEMM | ggml `dequant_funcs{,_cm2}.glsl` + `dequant_*.comp` |
+| **ch19** | MoE | Router top-k + Expert dispatch + Combine + 稀疏 Gather/Scatter demo | ncnn-MoE-Runtime `forward_router/forward_moe` / ggml `ggml_vk_mul_mat_id` |
+| **ch20** | K-quant | Q2_K ~ Q6_K super-block + MXFP4 E2M1 + NVFP4 E4M3 两级缩放 demo | ggml 44 种类型：NVFP4 / TQ / Q1_0 / Q2_0 / F8_E4M3 |
 
 ---
 
@@ -225,7 +227,7 @@ A + ch05 → ch06 → ch09（养成 profile 习惯） → ch15 → ch16 → ch17
 B + ch19（MoE 是大模型特化，ncnn MoE-Runtime 用得到）+ 持续对照 ncnn source 调试
 ```
 
-- **目标产物**：理解为什么 llama.cpp / llama.cpp 的 `vk_device.cpp` / `pipeline.cpp` 那么写
+- **目标产物**：理解为什么 llama.cpp 把设备、管线、图调度分别收敛到 `ggml-vulkan.cpp` / `ggml-vulkan-types.h` / `ggml_backend_vk_graph_compute()`，以及 ncnn-compiler 为何能把整张静态图 AOT 成模型专用 `.so`（见 ch12 新增小节）
 
 ---
 
@@ -233,18 +235,20 @@ B + ch19（MoE 是大模型特化，ncnn MoE-Runtime 用得到）+ 持续对照 
 
 如果你最终要写自己的推理引擎，这套课程的每一章都对应工业代码的一个具体子系统。给你一张"读源码的导航表"——读完对应章节后，去读这个仓库的这份代码，会豁然开朗：
 
-| 你的目标 | 该看的工业代码 | 对照课程章节 |
+| 你的目标 | 该看的工业代码（现行路径） | 对照课程章节 |
 |----------|----------------|--------------|
-| 设备探测 / fp16 决定走哪条 kernel | `ncnn::VulkanDevice::init_device()` | ch00 |
-| 上传 / 读回的 staging 隐藏 | `ncnn::VkStagingAllocator::current()` | ch03 |
-| 计算管线封装（管线 + 描述符 + dispatch 一站） | `ncnn::VkCompute::dispatch()` | ch04 起 |
-| 权重常驻 + 显存分配 | `ncnn::VkBlobAllocator::stage_buffer()` | ch10 |
-| 计算图录制 + barrier | `ggml::ggml_vk::graph_compute()` | ch12 |
-| Tensor Core GEMM | `ncnn/gemm_cm.comp` 或 `ggml-vulkan/mul_mm_cm2.comp` | ch15 |
-| FlashAttention kernel | `ggml-vulkan/flash_attn.comp` | ch17 |
-| 量化反量化 + 融合 | `ggml/dequant_funcs.glsl` | ch11 / ch18 |
-| MoE 调度 | `ggml/cuda/op_mul_mat_id.cu`（vulkan 版在 `ggml-vulkan` 里） | ch19 |
-| K-quant / MXFP4 | `ggml/iq-quants.c` + 对应 vulkan kernel | ch20 |
+| 设备探测 / 能力决定 kernel 变体 | `ncnn/src/gpu.cpp::create_gpu_instance()`、`VulkanDevice::info`（`src/gpu.h`）；ggml `ggml-vulkan-types.h::vk_device_struct` | ch00 |
+| 录制 + 一次性提交 | `ncnn/src/command.h::VkCompute::record_pipeline()` / `submit_and_wait()`（实现见 `command.cpp` 的 `delayed_records`） | ch02、ch04 起 |
+| 上传 / 读回的 staging 隐藏 | `ncnn/src/allocator.h::VkStagingAllocator::fastMalloc()`；`VkWeightAllocator` 权重常驻 | ch03、ch10 |
+| 权重常驻 + 显存分配 | `VkBlobAllocator`（`preferred_block_size` 默认 16MB）/ `VkWeightAllocator`（8MB） | ch10 |
+| 计算图录制 + barrier | `ggml/src/ggml-vulkan/ggml-vulkan.cpp::ggml_backend_vk_graph_compute()` | ch12 |
+| 静态图 AOT（无运行时解释器） | `ncnn-compiler/docs/ncnn-vulkan-backend-contract.md` + `tools/VulkanLifecycleCodegen.cpp`、`lib/Support/VulkanHostProgram.cpp` | ch12 |
+| Tensor Core GEMM | `ncnn/src/layer/vulkan/shader/gemm_cm.comp`（17 个 `*_cm.comp` 之一）；`ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp` | ch15 |
+| FlashAttention kernel | 本课程 `ch17_flash_attn/main_kvcache.cpp` + `shaders/{kvcache_append,flash_attn_decode_phase1,flash_attn_decode_phase2}.comp`；工业侧 `ncnn/.../shader/sdpa_fa.comp` + `sdpa_fa_cm.comp`、`ggml/.../vulkan-shaders/flash_attn*.comp` | ch17 |
+| 量化反量化 + 融合 | 本课程 `ch20_frontier_quant/main_nvfp4.cpp` + `shaders/nvfp4_gemm.comp`；工业侧 `ggml/.../vulkan-shaders/dequant_funcs.glsl`、`dequant_funcs_cm2.glsl`、`dequant_*.comp`，结构定义 `ggml/src/ggml-quants.c` | ch11 / ch18 / ch20 |
+| MoE 调度 | 本课程 `ch19_moe/main_sparse.cpp` + `shaders/{count_experts,expert_gather,expert_gemm_sparse,moe_combine_sparse}.comp`；工业侧 `ggml-vulkan.cpp::ggml_vk_mul_mat_id()` + `topk_moe.comp` / `count_experts.comp`，ncnn-MoE-Runtime `src/graph/router.h` + `src/engine/expert.h` + `src/kernels/vulkan/` | ch19 |
+| K-quant / MXFP4 / NVFP4 | `ggml/include/ggml.h` 的 `GGML_TYPE_*`（44 种）+ `dequant_{q*,k*,iq*,mxfp4,nvfp4,tq*}.comp`；本课程 `ch20_frontier_quant/shaders/nvfp4_gemm.comp` | ch20 |
+| 多队列 / 流水线缓存 | ncnn `VulkanDevice::acquire_queue()`、`PipelineCache::save_cache()/load_cache()` | ch09 / ch12 |
 
 **判断你是否"出师"的硬指标（README 里也写了）：**
 
@@ -275,7 +279,7 @@ B + ch19（MoE 是大模型特化，ncnn MoE-Runtime 用得到）+ 持续对照 
 
 ### 今天就要动起来（30 分钟）
 
-1. `cmake -B build && cmake --build build -j` —— 看 21 个目标都成功
+1. `cmake -B build && cmake --build build -j` —— 看 24 个目标都成功（21 章主程序 + `ch19_moe_sparse` / `ch17_kvcache` / `ch20_nvfp4`）
 2. `./build/ch00_environment/ch00_environment` —— 截屏你的设备能力（存 `device_report.txt`）
 3. `./build/ch01_vector_add/ch01_vector_add` —— 看 `a+b==c` 全对
 4. 打开 `ch01_vector_add/docs/ch01_vector_add.md` —— "动手实验 #4" 改 `.comp`，重 build，重跑

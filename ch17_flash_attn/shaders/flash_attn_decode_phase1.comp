@@ -1,0 +1,90 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Decode 阶段 1（split）：把 KV cache 按 tile 分给多个 workgroup 并行处理。
+//
+// 与本章 `flash_attn.comp` 的区别：
+//   flash_attn.comp      : 1 个 workgroup 串行扫完整个序列（prefill 思路）
+//   decode phase1/phase2 : phase1 每个 workgroup 处理一个 key tile，输出局部
+//                          online-softmax 状态；phase2 再做全局归约。
+//   长上下文时 phase1 的 workgroup 数 = ceil(seqLen / tileSize)，并行度更高。
+//
+// 局部状态（尚未归一化）：
+//   m_i = max score
+//   l_i = Σ exp(score - m_i)
+//   o_i = Σ exp(score - m_i) · V      (d 维向量，未除以 l_i)
+//
+// 对应工业实现：ggml `flash_attn_decode_phase_1.comp` + `flash_attn_split_k_reduce.comp`。
+
+layout(local_size_x = 32) in;   // 1 个 subgroup，与 flash_attn.comp 一致
+
+layout(std430, binding = 0) readonly buffer QBuf       { float Q[];       };  // 1 × d
+layout(std430, binding = 1) readonly buffer CacheK     { float K[];       };  // seqLen × d
+layout(std430, binding = 2) readonly buffer CacheV     { float V[];       };  // seqLen × d
+layout(std430, binding = 3) writeonly buffer PartialO  { float partO[];   };  // numTiles × d
+layout(std430, binding = 4) writeonly buffer PartialM  { float partM[];   };  // numTiles
+layout(std430, binding = 5) writeonly buffer PartialL  { float partL[];   };  // numTiles
+
+layout(push_constant) uniform PC {
+    uint seqLen;
+    uint d;
+    uint tileSize;
+};
+
+void main() {
+    uint tid     = gl_LocalInvocationID.x;   // 0..31
+    uint tileIdx = gl_WorkGroupID.x;
+    uint kStart  = tileIdx * tileSize;
+    uint kEnd    = min(kStart + tileSize, seqLen);
+
+    uint elemsPerThread = (d + 31u) / 32u;
+    uint colBase = tid * elemsPerThread;
+
+    // 空 tile 写中性状态，避免 phase2 读到未初始化数据
+    if (kStart >= seqLen) {
+        for (uint i = 0u; i < elemsPerThread; ++i) {
+            uint col = colBase + i;
+            if (col < d) partO[tileIdx * d + col] = 0.0f;
+        }
+        if (tid == 0u) { partM[tileIdx] = -1e30f; partL[tileIdx] = 0.0f; }
+        return;
+    }
+
+    float q_reg[4];      // d <= 128
+    float o_acc[4];
+    for (uint i = 0u; i < elemsPerThread; ++i) {
+        uint col = colBase + i;
+        q_reg[i] = (col < d) ? Q[col] : 0.0f;
+        o_acc[i] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float inv_sqrt_d = inversesqrt(float(d));
+
+    for (uint k = kStart; k < kEnd; ++k) {
+        float partial = 0.0f;
+        for (uint i = 0u; i < elemsPerThread; ++i) {
+            uint col = colBase + i;
+            if (col < d) partial += q_reg[i] * K[k * d + col];
+        }
+        float score = subgroupAdd(partial) * inv_sqrt_d;
+
+        float m_new   = max(m, score);
+        float rescale = exp(m - m_new);
+        float p       = exp(score - m_new);
+
+        l = l * rescale + p;
+        for (uint i = 0u; i < elemsPerThread; ++i) {
+            uint col = colBase + i;
+            if (col < d) o_acc[i] = o_acc[i] * rescale + p * V[k * d + col];
+        }
+        m = m_new;
+    }
+
+    // 写局部状态（不归一化，留给 phase2 合并）
+    for (uint i = 0u; i < elemsPerThread; ++i) {
+        uint col = colBase + i;
+        if (col < d) partO[tileIdx * d + col] = o_acc[i];
+    }
+    if (tid == 0u) { partM[tileIdx] = m; partL[tileIdx] = l; }
+}

@@ -115,9 +115,14 @@ Verification tolerances in this chapter:
 
 ## 11.8 Industrial-grade Comparison
 
-- **ncnn**: supports `int8` convolution / fully-connected layers, with weights stored as int8 and kernel-side fusion of "multiply by scale + add bias"; it also provides an INT8 `convolution` variant that exploits hardware integer instructions.
-- **llama.cpp / ggml-vulkan**: quantization is its foundation. Models are stored on disk in formats such as Q4/Q8; at inference time `mul_mm` calls the corresponding `dequant` function according to the weight type, **unpacking and dequantizing in shared memory** before doing the matrix multiply, completely avoiding materializing FP32 weights. Since v1.17 it also caches the compiled SPIR-V to speed up startup.
-- **Q4_0 vs Q8_0 choice**: Q8_0 offers higher precision and speed (less unpacking overhead), suitable for precision-sensitive layers (e.g., attention Q/K/V projections); Q4_0 offers higher compression, ideal for memory-constrained scenarios (e.g., running 7B+ models on a single GPU). llama.cpp also supports mixed precision: different layers can use different quantization formats.
+- **ncnn**: int8 conv / fully-connected remains the main path; `src/layer/vulkan/shader/` now includes `convolution_*_int8.comp`, `gemm_int8.comp`, `gemm_quantize_{A,B}_int8.comp`, `gemm_quantize_B_{absmax,descale}_int8.comp`, plus int8 coopmat / Winograd variants (see ch15). Weights stay int8 in memory; "scale multiply + bias add" is fused into the kernel.
+- **llama.cpp / ggml-vulkan** (as of 2026-11): dequantization is no longer "one `dequant_funcs` file" but three layers:
+  - `ggml/src/ggml-quants.c` — CPU-side block layouts and quantization algorithms (the old `iq-quants.c` was merged into it);
+  - `vulkan-shaders/dequant_funcs.glsl` / `dequant_funcs_cm2.glsl` / `dequant_head.glsl` — shared GLSL unpacking snippets;
+  - 26 `vulkan-shaders/dequant_<format>.comp` — per-format kernels for `q4_0/q8_0/q*_k/iq*/mxfp4/nvfp4/q1_0/q2_0/tq1_0/tq2_0`.
+  - SPIR-V is generated **at build time** from 155 `.comp` templates by `vulkan-shaders-gen` + glslc; the result is compiled into the binary as `.comp.cpp` arrays, and no prebuilt `.spv` ships in the repo. The "since v1.17 caches compiled SPIR-V to speed up startup" claim from the first release therefore no longer applies.
+- **Quantization landscape**: `ggml/include/ggml.h` now has `GGML_TYPE_COUNT = 44`; besides Q4_0/Q8_0, K-quants and I-quants there are Q1_0/Q2_0, TQ1_0/TQ2_0, MXFP4/NVFP4 and F8_E4M3 (see ch20).
+- **Q4_0 vs Q8_0 choice**: Q8_0 gives higher precision with cheaper unpacking (good for Q/K/V projections); Q4_0 gives higher compression for memory-bound setups. ggml supports per-layer mixed precision (`llama-quant.cpp`).
 
 ## 11.9 Code Structure
 

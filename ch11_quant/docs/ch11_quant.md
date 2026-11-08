@@ -115,9 +115,14 @@ Group-wise 量化（Q4_0/Q8_0）相比 per-tensor（int8）的优势：
 
 ## 11.8 对照工业级
 
-- **ncnn**：支持 `int8` 卷积/全连接，权重以 int8 存储，kernel 内做「乘以 scale + 加 bias」的融合；还提供 INT8 的 `convolution` 变体，利用硬件整数指令。
-- **llama.cpp / ggml-vulkan**：量化是立身之本。模型以 Q4/Q8 等形式存盘；推理时 `mul_mm` 按权重类型调用对应的 `dequant` 函数，**在共享内存里解包反量化**后做矩阵乘，完全避免物化 FP32 权重。v1.17 起还缓存编译好的 SPIR-V 以加速启动。
-- **Q4_0 vs Q8_0 的选择**：Q8_0 精度高、速度快（解包开销小），适合对精度敏感的层（如 attention 的 Q/K/V 投影）；Q4_0 压缩比高，适合显存瓶颈严重的场景（如单卡跑 7B+ 模型）。llama.cpp 也支持混合精度：不同层用不同量化格式。
+- **ncnn**：int8 卷积/全连接仍是主力；`src/layer/vulkan/shader/` 下新增 `convolution_*_int8.comp`、`gemm_int8.comp`、`gemm_quantize_{A,B}_int8.comp`、`gemm_quantize_B_{absmax,descale}_int8.comp`，并有 int8 版 coopmat / Winograd 变换（见 ch15）。权重以 int8 存储，kernel 内融合「乘 scale + 加 bias」。
+- **llama.cpp / ggml-vulkan**（2026-11 现状）：反量化不再是「一个 `dequant_funcs` 文件」，而是三层：
+  - `ggml/src/ggml-quants.c`：CPU 侧 block 结构与量化算法定义（旧的 `iq-quants.c` 已并入此文件）；
+  - `vulkan-shaders/dequant_funcs.glsl` / `dequant_funcs_cm2.glsl` / `dequant_head.glsl`：GLSL 公共解包片段；
+  - 26 个 `vulkan-shaders/dequant_<format>.comp`：`q4_0/q8_0/q*_k/iq*/mxfp4/nvfp4/q1_0/q2_0/tq1_0/tq2_0` 各自的独立反量化 kernel。
+  - SPIR-V **在构建期**由 `vulkan-shaders-gen` + glslc 从 155 个 `.comp` 模板生成，产物以 `.comp.cpp` 数组形式编进二进制，仓库里没有预编译 `.spv`；因此首版文档里「v1.17 起缓存编译好的 SPIR-V 以加速启动」的说法已不适用。
+- **量化类型全景**：`ggml/include/ggml.h` 现有 `GGML_TYPE_COUNT = 44`，除 Q4_0/Q8_0、K-quant、I-quant 外还有 Q1_0/Q2_0、TQ1_0/TQ2_0、MXFP4/NVFP4、F8_E4M3（详见 ch20）。
+- **Q4_0 vs Q8_0 的选择**：Q8_0 精度高、解包开销小，适合精度敏感层（attention 的 Q/K/V 投影）；Q4_0 压缩比高，适合显存瓶颈严重的场景。ggml 支持逐层混合精度（`llama-quant.cpp`）。
 
 ## 11.9 本章代码结构
 

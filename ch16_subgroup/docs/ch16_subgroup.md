@@ -234,6 +234,7 @@ ncnn 在 Vulkan 后端广泛使用 subgroup 操作加速：
 - **Winograd 卷积**：用 subgroup 加速 tile 内的数据搬移
 - **Reduction 算子**：`subgroupAdd` 替代共享内存归约
 - **Softmax**：warp-level softmax 用于注意力头内的归一化
+- **2026-11 同步**：`shader/reduction.comp` 的共享累加器已改为 `shared float sdata[256]` + `init_acc()/element_accum()` 的 **fp32 累加**并启用 subgroup arithmetic；`rmsnorm` / `layernorm` / `groupnorm` / `instancenorm` 的 Vulkan 路径陆续改成 subgroup 归约（#6754 / #6755 / #7135 / #7136 / #7247）。这既印证本章「subgroup 替代共享内存归约」，也提醒：**换用 subgroup 仍要保证累加精度**。
 
 ### ggml (llama.cpp) 中的 Subgroup 使用
 

@@ -1,0 +1,38 @@
+#version 450
+// ch19_moe/shaders/moe_combine_sparse.comp
+// 稀疏 MoE 第 4 步：按反查表把稀疏结果 gather 回每个 token，做 top-k 加权和。
+//
+//   final_out[t, d] = Σ_k weights[t, k] * partial[gather_slot[t, k], d]
+//
+// 与 dense 版 `combine.comp` 的区别：
+//   dense : 用 [expert][token][dim] 三维布局直接索引 expert_outputs[e, t, d]
+//   sparse: 用 gather_slot 反查紧凑结果，避免物化 num_experts × num_tokens 的输出
+//
+// 对应工业实现：ncnn-MoE-Runtime `moe_combine.comp` / `moe_combine_single_row.comp`。
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer Partial   { float partial[];    };
+layout(std430, binding = 1) readonly buffer GatherSlot{ uint gather_slot[]; };
+layout(std430, binding = 2) readonly buffer Weights   { float weights[];    };
+layout(std430, binding = 3) writeonly buffer Final    { float final_out[];  };
+
+layout(push_constant) uniform PC {
+    uint num_tokens;
+    uint top_k;
+    uint dim;
+};
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    uint t = gl_GlobalInvocationID.y;
+    if (t >= num_tokens || d >= dim) return;
+
+    float acc = 0.0f;
+    for (uint k = 0u; k < top_k; ++k) {
+        uint entry = t * top_k + k;
+        uint slot  = gather_slot[entry];
+        acc += weights[entry] * partial[slot * dim + d];
+    }
+    final_out[t * dim + d] = acc;
+}

@@ -205,28 +205,43 @@ FlashAttention 的算术强度（FLOP / byte）远高于标准注意力，因为
 
 ## 17.5 工业级对照
 
-### 17.5.1 ncnn 的 `sdpa_fa.comp`
+### 17.5.1 ncnn 的 SDPA 家族（2026-11 现状）
 
-ncnn 的 FlashAttention 实现（`sdpa_fa.comp`）使用 2×2 unroll 策略，即每个工作组同时处理 2 个 query 行和 2 个 key 位置，通过 local memory 缓存 tile 数据。它支持 cooperative matrix 加速版本（`sdpa_fa_cm.comp`），利用 Tensor Core 硬件加速矩阵乘法部分。
+着色器都在 `src/layer/vulkan/shader/`（单数目录），已从「单个 `sdpa_fa.comp`」扩展为 6 个：
 
-### 17.5.2 ggml (llama.cpp) 的 `flash_attn.comp`
+| Shader | 职责 |
+|--------|------|
+| `sdpa_fa.comp` / `sdpa_fa_cm.comp` | 标量 / coopmat 版 FlashAttention（2×2 unroll + local memory tile） |
+| `sdpa_cross.comp` / `sdpa_cross_cm.comp` | 交叉注意力（encoder-decoder / 多模态） |
+| `sdpa_kvcache_append.comp` / `sdpa_kvcache_copy.comp` | 增量解码时的 KV cache 追加与搬运 |
 
-ggml 的 FlashAttention 实现使用完整的分块策略 + subgroup 操作，与本章实现类似。它提供多套变体：
-- **标量路径**：基本分块，适用于小序列
-- **CM 路径**：使用 cooperative matrix 加速（`flash_attn_cm1.comp`）
-- **CM2 路径**：NVIDIA 专属的 coopmat2 加速（`flash_attn_cm2.comp`）
-- **Split-K 路径**：将 K 维度分到多个工作组，最后归约（适用于大序列）
+`src/layer/vulkan/sdpa_vulkan.cpp` 负责 GQA、mask 广播、KV cache 与 fp32 累加路径选择；2026-11 的 #7247 把 Reduction 的共享累加器从 half 改为 **fp32**，正是本章「在线 softmax 数值稳定」在工业代码里的对应物。
+
+### 17.5.2 ggml (llama.cpp) 的 `flash_attn*` 家族
+
+`ggml/src/ggml-vulkan/vulkan-shaders/` 下不再是「一个文件三路径」，而是拆成 8 个 `.comp` 变体 + 3 个 `.glsl` 公共片段：
+
+- `flash_attn.comp` + `flash_attn_base.glsl` / `flash_attn_dequant.glsl` / `flash_attn_mmq_funcs.glsl`：标量基线与公共片段
+- `flash_attn_cm1.comp` / `flash_attn_cm2.comp`：KHR coopmat / NVIDIA CM2
+- `flash_attn_decode_phase_1.comp` / `flash_attn_decode_phase_2.comp`：**decode 两阶段**拆分（prefill 与逐 token 解码走不同 kernel）
+- `flash_attn_split_k_reduce.comp` / `mul_mat_split_k_reduce.comp`：Split-K 归约
+- `flash_attn_sparse_compact.comp` / `flash_attn_mask_opt.comp`：稀疏压缩与 mask 优化
+- `dequant_funcs.glsl` / `dequant_funcs_cm2.glsl`：量化 K/V 在 FA 内部就地解包
 
 ### 17.5.3 对比总结
 
-| 特性 | 本章实现 | ncnn sdpa_fa | ggml flash_attn |
-|------|---------|-------------|-----------------|
+| 特性 | 本章实现 | ncnn SDPA 家族 | ggml flash_attn 家族 |
+|------|---------|---------------|---------------------|
 | Subgroup 归约 | ✓ (subgroupAdd) | ✓ | ✓ |
 | 共享内存 K/V tile | ✗（直接读全局） | ✓ (local mem) | ✓ |
-| Online softmax | ✓ | ✓ | ✓ |
-| CM 加速 | ✗ | ✓ (KHR+NV) | ✓ (KHR+NV+CM2) |
-| Split-K | ✗ | ✗ | ✓ |
-| KV cache 支持 | ✗ | ✓ | ✓ |
+| Online softmax | ✓ | ✓（fp32 累加） | ✓ |
+| CM 加速 | ✗ | ✓ (`sdpa_fa_cm.comp`) | ✓ (CM1 + CM2) |
+| Split-K | ✗ | ✗ | ✓ (`split_k_reduce.comp`) |
+| KV cache 支持 | ✗ | ✓ (`kvcache_append/copy.comp`) | ✓（decode 两阶段） |
+| 交叉注意力 | ✗ | ✓ (`sdpa_cross*.comp`) | ✓（mtmd 路径） |
+| 量化 K/V 就地解包 | ✗ | ✗ | ✓ (`flash_attn_dequant.glsl`) |
+
+> 进阶练习 #3「实现 KV cache 版本」**已有可运行参考实现，见 17.8**；对照 `sdpa_kvcache_append.comp` 与 `flash_attn_decode_phase_*.comp` 可以看到工业级做法：把 prefill 与 decode 分成不同 kernel，而不是让同一个融合 kernel 兼顾两者。
 
 ---
 
@@ -254,5 +269,44 @@ ggml 的 FlashAttention 实现使用完整的分块策略 + subgroup 操作，�
 - Subgroup 操作（`subgroupAdd`）用于高效的 warp 级点积归约
 - 本章实现的是简化的 Br=1 版本，实际工业实现支持多 query 行 tile、cooperative matrix 加速、causal mask 等扩展
 - 工业级实现（ncnn、ggml）在 FlashAttention 基础上增加了 CM 加速、Split-K、KV cache 等特性
+
+---
+
+## 17.8 进阶实现：KV cache 增量解码与 decode 两阶段
+
+`ch17_kvcache`（`main_kvcache.cpp` + 3 个新 shader）是「实现 KV cache 版本」这道动手题的可运行参考实现，也是本次同步四个参考仓库后新增的代码。它是独立可执行目标，不改动 `main.cpp`，因此不影响 ch00~ch20 的既有验证结论。
+
+主程序的 `flash_attn.comp` 是 **prefill 思路**：每个 workgroup 处理一个 query 行，串行扫完整个序列。真实 LLM 解码时每步只有 1 个新 query，却要读不断增长的 KV cache，因此工业引擎把 decode 拆成不同 kernel：
+
+| 阶段 | Shader | 作用 | 工业对应 |
+|------|--------|------|----------|
+| append | `kvcache_append.comp` | 把新 token 的 K/V 写到 cache 末尾，无需重排 | ncnn `sdpa_kvcache_append.comp` / `sdpa_kvcache_copy.comp` |
+| split | `flash_attn_decode_phase1.comp` | cache 按 tile=32 分给多个 workgroup，各自算局部 online softmax 状态 `(m_i, l_i, o_i)` | ggml `flash_attn_decode_phase_1.comp` |
+| reduce | `flash_attn_decode_phase2.comp` | 全局归约得到最终输出 | ggml `flash_attn_decode_phase_2.comp` / `flash_attn_split_k_reduce.comp` |
+
+### 关键公式
+
+phase1 输出的局部状态**未归一化**：`o_i = Σ exp(score − m_i)·V`、`l_i = Σ exp(score − m_i)`。phase2 用与 online softmax 同源的重缩放合并：
+
+```
+m = max_i m_i
+O = Σ_i exp(m_i − m) · o_i
+L = Σ_i exp(m_i − m) · l_i
+final = O / L
+```
+
+这就是 FlashAttention 的 split-K 归约：把「一个 workgroup 扫全部」换成「多个 workgroup 分块 + 一次归约」，长上下文下的并行度从 1 提升到 `ceil(seqLen / tileSize)`。
+
+### 验证
+
+demo 取 `d=64`、prefill 长度 256、4 个 decode step（seqLen 257→260），每步同时跑「两阶段」与「单 kernel 基线」（复用本章 `flash_attn.spv`，只 dispatch 1 个 query 行），做 4 组检查：cache append 内容、两阶段 vs CPU 参考、单 kernel vs CPU 参考、两阶段 vs 单 kernel 交叉验证。4 步全部 **0 错误**。
+
+> 本 demo **不宣称加速比**：短序列下两阶段多一次 dispatch 与全局同步，实测可能更慢；收益来自长上下文的并行度。这也解释了 ncnn 把 KV cache 做成独立 shader、ggml 把 decode 拆成 `phase_1` / `phase_2` 的做法。
+
+### 动手
+
+1. 把 `PROMPT_LEN` 改成 1024，观察 `tiles` 从 9 增长到 33，并用 GPU 时间戳对比单 kernel 与两阶段
+2. 把 phase2 改成两级树形归约（先按 group 归约再全局归约），适应更长上下文
+3. 给 append 加上写满后的 ring buffer / 滑动窗口逻辑
 
 下一章（ch18）我们将探索 **量化体系深入**——从 int8 到 Q4_0/Q8_0/K-quant 再到 MXFP4 的 GPU 端反量化与融合推理。

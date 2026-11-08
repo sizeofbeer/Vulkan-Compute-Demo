@@ -3,6 +3,8 @@
 > 验证目标：各章程序「实际输出」是否与「理论/文档期望」一致（CPU 参考 vs Vulkan GPU 结果）。
 > 验证环境：Windows 11 + **NVIDIA GeForce GTX 1080 Ti**（Pascal，驱动 api_version 1.3，`VK_KHR_cooperative_matrix` 不支持）+ Vulkan SDK（glslc 2026.3）+ g++/MSYS2 + Ninja。
 > 验证日期：2026-08-19
+>
+> 2026-11-08 补充：本次同步了四个参考仓库的版本锚点、源码导航与各章「工业级对照」文档，修正 `common/vk_base.h` 注释，并**新增三个独立进阶 demo**（`ch19_moe_sparse` / `ch17_kvcache` / `ch20_nvfp4`；**未改动任何已验证的 kernel / 主程序逻辑**）。已重新执行 `cmake -B build -G Ninja && cmake --build build`（24 个可执行目标全部成功），`ch19_moe` / `ch17_flash_attn` / `ch20_frontier_quant` 原验证流程重跑一致。新增 demo 的验证：稀疏 MoE 三项检查 0 错误（最大误差 9.5e-7、RMSE 1.8e-7）；KV cache decode 4 步的 append / 两阶段 vs CPU / 单 kernel vs CPU / 交叉验证全部 0 错误；NVFP4 与 MXFP4 的 GPU 融合 GEMM vs CPU 参考均 0 错误（RMSE 1.46e-6）。因此下面的 CPU vs Vulkan 验证结论仍然有效。参考仓库现状见 `README.md` 第 4 节；三个 demo 分别见 ch19 docs 19.11、ch17 docs 17.8、ch20 docs「NVFP4：两级 E4M3 缩放」。
 
 ## 一、总览
 

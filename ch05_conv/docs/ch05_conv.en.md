@@ -75,11 +75,12 @@ The main submits the pipeline in the order: filter_transform → input_transform
 
 ### Comparison with ncnn
 
-ncnn's Winograd implementation (`convolution_winograd.cpp`) goes further with extreme optimizations:
+ncnn's Winograd implementation (layer code `src/layer/vulkan/convolution_vulkan.cpp`, shaders `src/layer/vulkan/shader/convolution_*winograd*.comp`; the `convolution_winograd.cpp` file cited in the first release does not exist) goes further with extreme optimizations:
 - **NC4HW4 packing**: packs 4 channels into a `vec4`, computing 4 channels with one SIMD operation
 - **Multi-tile merging**: merges multiple 4×4 tiles into a single large matrix multiply, increasing arithmetic density
 - **F(6×6, 3×3)**: larger tiles further reduce multiplications (but require higher numerical precision)
 - **Fused output transform**: fuses the output transform with bias addition / activation, reducing memory bandwidth
+- **int8 / coopmat variants (added by 2026-11)**: `convolution_3x3s1d1_winograd{23,43}_transform_input_int8_cm.comp`, `convolution_winograd_gemm_cm.comp`, `convolution_gemm_int8_cm.comp`, `convolution1d_*_cm.comp` (see ch15)
 
 The implementation in this chapter is pedagogically equivalent to a "single-channel, single-tile" version, without packing / fusion / multi-tile merging, but the core mathematics is the same.
 

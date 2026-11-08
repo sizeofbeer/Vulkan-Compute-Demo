@@ -223,33 +223,38 @@ ctx.physical.getCooperativeMatrixPropertiesKHR(&propCount, props.data());
 
 ### 15.7.3 工业级实践
 
-**ncnn**：使用 `gemm_cm.comp` 作为 CM 路径，回退到 `gemm_tiled.comp`。它通过 `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` 查询支持的 tile 尺寸，为不同硬件选择最优参数。
+**ncnn**：着色器目录是 `src/layer/vulkan/shader/`（**单数**），CM 路径为 `gemm_cm.comp`，标量回退为 `gemm.comp` / `gemm_sg.comp`。主机侧不再直接暴露裸的 `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` 调用，而是封装成 `VulkanDevice::get_optimal_cooperative_matrix_mnk(..., coopmat_acctype)`（`src/gpu.h`），由 `Option::use_cooperative_matrix`（默认开启）与 `GpuInfo` 的能力位共同决定是否走 CM 路径。
 
-**llama.cpp / ggml-vulkan**：`mul_mm_cm2.comp` 是大矩阵路径的首选。对于小矩阵，使用 `mul_mm.comp`（传统 tiling）。它还通过 `VK_EXT_cooperative_matrix_maintenance1` 的 flexible dimensions 支持更灵活的 tile 选择。
+**llama.cpp / ggml-vulkan**：`vulkan-shaders/mul_mm_cm2.comp` 仍是 CM2（含 decode vector）主路径，小矩阵走 `mul_mm.comp`；新增 `mul_mmq_cm1.comp`、CM1/CM2 版 `conv2d/conv3d` 等。155 个 `.comp` 模板由 `vulkan-shaders-gen` + glslc 在构建期生成 SPIR-V，仓库里没有预编译 `.spv`。
 
 ---
 
 ## 15.8 与工业级实现的对照
 
-### 15.8.1 ncnn 的 gemm_cm.comp
+### 15.8.1 ncnn 的 gemm_cm.comp（2026-11 现状）
 
-ncnn 的 CM 实现特点：
-- 使用 `#extension GL_NV_cooperative_matrix : enable`（早期版本）或 `GL_KHR_cooperative_matrix`
-- 支持 FP16 和 INT8 的 CM 路径
-- 配合 `elempack=4` 打包，减少访存次数
-- 通过 `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` 自动选择 tile 尺寸
-- 回退路径与 CM 路径共享同一个 pipeline 选择逻辑
+- 路径：`ncnn/src/layer/vulkan/shader/gemm_cm.comp`；同目录共 **17 个** `*_cm.comp`，覆盖 GEMM、卷积/反卷积、Winograd 变换与 GEMM、1D 卷积、SDPA/交叉注意力。
+- 同时保留 KHR 与 NV 两套 coopmat 路径，并用 `UNROLL_SG/WG` 宏控制分块展开；近期修复了 Adreno/Mali 的 `coopMatLoad/Store` stride 与 four-row matrices。
+- 数据类型从 FP16 扩展到 **BF16、INT8**（`gemm_int8_cm.comp`、`convolution_*_int8_cm.comp`），累加器强调 fp32（`get_optimal_cooperative_matrix_mnk` 会返回 `coopmat_acctype`）。
+- shader 内不再依赖共享内存 padding 的旧写法（实测「无 padding」更快）；`elempack=4` 打包与 int8 pack4 规范见 `docs/developer-guide/glsl-extension.md`。
 
-### 15.8.2 ggml 的 mul_mm_cm2.comp
+### 15.8.2 ggml 的 mul_mm_cm2.comp（2026-11 现状）
 
-ggml 的 CM 实现特点：
-- 专门为大矩阵（≥ 1024）优化
-- 使用 `VK_KHR_cooperative_matrix` 扩展
-- 支持 FP16、BF16 数据类型
-- 通过 `VK_EXT_subgroup_size_control` 控制 subgroup 大小以匹配 CM 需求
-- 与传统 `mul_mm.comp` 共享 buffer 管理，但使用不同的 pipeline
+- 路径：`ggml/src/ggml-vulkan/vulkan-shaders/mul_mm_cm2.comp`；`mul_mm_id_funcs.glsl`、`dequant_funcs_cm2.glsl` 提供 CM2 下的解包。
+- 支持 `VK_KHR_cooperative_matrix`、`VK_NV_cooperative_matrix2`、`VK_EXT_cooperative_matrix_maintenance1`、subgroup size control。
+- 量化类型已扩到 44 种（含 MXFP4 / NVFP4 / Q1_0 / Q2_0 / TQ / F8_E4M3），CM2 路径与 `dequant_*` 系列协同。
+- 设备/管线结构统一在 `ggml-vulkan-types.h`；旧的 `vk-device.cpp` / `pipeline.cpp` / `vk_pipeline_wrapper` 已移除。
 
-### 15.8.3 本章的对比思路
+### 15.8.3 本次同步新增的硬件能力（值得做进阶实验）
+
+| 能力 | ncnn 侧 | ggml 侧 |
+|------|---------|---------|
+| bf16 / int8 coopmat | `gemm_int8_cm.comp`、bf16 packed GEMM | `dequant_*` + CM1/CM2 量化路径 |
+| 维护扩展 | `VK_EXT_cooperative_matrix_maintenance1`、`VK_NV_cooperative_matrix2`、cooperative vector、float8、OCP microscaling | 同上 + `mul_mmq_cm1.comp` |
+| 累加精度 | Reduction 改为 fp32 累加（2026-11 #7247） | FA decode 阶段的 fp32 累加 |
+| 主机侧形状选择 | `get_optimal_cooperative_matrix_mnk()` 返回 M/N/K/subgroup size/acctype | 生成期按 shape 编译多套 pipeline |
+
+### 15.8.4 本章的对比思路
 
 本章的 `gemm_cm.comp` 同时包含了 CM 路径和 fallback 路径：
 - **CM 路径**：使用 `cooperativeMatrixMulAdd` 单条指令完成矩阵乘加，由 Tensor Core 硬件执行

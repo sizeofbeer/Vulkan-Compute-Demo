@@ -60,7 +60,7 @@ CPU 内存 --map 写--> host-visible staging buffer --GPU copyBuffer--> device-l
 
 ## 3.6 对照工业级
 
-- **ncnn**：显式区分三类分配器——`VkBlobAllocator`（16MB 池，放激活值，device-local）、`VkWeightAllocator`（权重常驻 device-local）、`VkStagingAllocator`（host-visible 中转）。权重只在模型加载时上传一次。
-- **llama.cpp / ggml-vulkan**：加载模型时把权重映射到 device-local；推理时输入/输出走 staging；并通过 `dev->device_vk` 记录的内存属性选择最优上传路径。
+- **ncnn**：显式区分三类分配器（`src/allocator.h`）——`VkBlobAllocator`（`preferred_block_size` 默认 16MB，放激活值）、`VkWeightAllocator`（默认 8MB，权重常驻）、`VkStagingAllocator`（host-visible 中转），三者统一通过 `fastMalloc()` 申请；权重只在模型加载时上传一次。
+- **llama.cpp / ggml-vulkan**：加载模型时把权重映射到 device-local，推理时输入/输出走 staging；内存属性记录在 `ggml-vulkan-types.h` 的 `vk_device_struct`（旧的 `dev->device_vk` 字段已移除）。
 
 下一章（ch04）我们终于进入神经网络的核心运算——**矩阵乘 GEMM**，并第一次认真用上「共享内存」和「合并访存」。

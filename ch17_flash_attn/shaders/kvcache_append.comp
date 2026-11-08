@@ -1,0 +1,27 @@
+#version 450
+// KV cache append：增量解码时把新 token 的 K/V 追加到 cache 末尾。
+//
+// 对应工业实现：ncnn `sdpa_kvcache_append.comp` / `sdpa_kvcache_copy.comp`、
+//               ggml 的 KV cache 视图 + `flash_attn_decode_phase_*.comp`。
+//
+// 每个 invocation 写 1 个 head 维度元素；writePos 由宿主按 decode step 传入，
+// 因此 cache 无需整体重排，prefill 之后权重/K/V 常驻显存。
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer NewK   { float nk[]; };
+layout(std430, binding = 1) readonly buffer NewV   { float nv[]; };
+layout(std430, binding = 2) buffer         CacheK  { float ck[]; };
+layout(std430, binding = 3) buffer         CacheV  { float cv[]; };
+
+layout(push_constant) uniform PC {
+    uint writePos;
+    uint d;
+};
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= d) return;
+    ck[writePos * d + j] = nk[j];
+    cv[writePos * d + j] = nv[j];
+}

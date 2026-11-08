@@ -205,28 +205,43 @@ FlashAttention's arithmetic intensity (FLOP / byte) is much higher than standard
 
 ## 17.5 Industrial Comparison
 
-### 17.5.1 ncnn's `sdpa_fa.comp`
+### 17.5.1 ncnn's SDPA family (as of 2026-11)
 
-ncnn's FlashAttention implementation (`sdpa_fa.comp`) uses a 2×2 unroll strategy, where each workgroup processes 2 query rows and 2 key positions simultaneously, using local memory for tile caching. It supports a cooperative matrix accelerated version (`sdpa_fa_cm.comp`) that leverages Tensor Core hardware for the matrix multiplication portion.
+All shaders live in `src/layer/vulkan/shader/` (singular). The single `sdpa_fa.comp` has grown into six:
 
-### 17.5.2 ggml (llama.cpp)'s `flash_attn.comp`
+| Shader | Role |
+|--------|------|
+| `sdpa_fa.comp` / `sdpa_fa_cm.comp` | Scalar / coopmat FlashAttention (2×2 unroll + local memory tiles) |
+| `sdpa_cross.comp` / `sdpa_cross_cm.comp` | Cross-attention (encoder-decoder / multimodal) |
+| `sdpa_kvcache_append.comp` / `sdpa_kvcache_copy.comp` | KV cache append and copy for incremental decoding |
 
-ggml's FlashAttention implementation uses a complete tiling strategy combined with subgroup operations, similar to this chapter's implementation. It provides multiple variants:
-- **Scalar path**: basic tiling, suitable for small sequences
-- **CM path**: cooperative matrix acceleration (`flash_attn_cm1.comp`)
-- **CM2 path**: NVIDIA-specific coopmat2 acceleration (`flash_attn_cm2.comp`)
-- **Split-K path**: partitions K dimension across workgroups, then reduces (for large sequences)
+`src/layer/vulkan/sdpa_vulkan.cpp` handles GQA, mask broadcast, KV cache and fp32-accumulation path selection. The 2026-11 change #7247 switched the reduction accumulator to **fp32** — the industrial counterpart of this chapter's numerically stable online softmax.
+
+### 17.5.2 ggml (llama.cpp)'s `flash_attn*` family
+
+`ggml/src/ggml-vulkan/vulkan-shaders/` no longer has "three paths in one file" but 8 `.comp` variants plus 3 shared `.glsl` snippets:
+
+- `flash_attn.comp` + `flash_attn_base.glsl` / `flash_attn_dequant.glsl` / `flash_attn_mmq_funcs.glsl`: scalar baseline and shared snippets
+- `flash_attn_cm1.comp` / `flash_attn_cm2.comp`: KHR coopmat / NVIDIA CM2
+- `flash_attn_decode_phase_1.comp` / `flash_attn_decode_phase_2.comp`: **two-phase decode** (prefill and per-token decoding use different kernels)
+- `flash_attn_split_k_reduce.comp` / `mul_mat_split_k_reduce.comp`: Split-K reduction
+- `flash_attn_sparse_compact.comp` / `flash_attn_mask_opt.comp`: sparse compaction and mask optimization
+- `dequant_funcs.glsl` / `dequant_funcs_cm2.glsl`: in-place unpacking of quantized K/V inside FA
 
 ### 17.5.3 Comparison Summary
 
-| Feature | This chapter | ncnn sdpa_fa | ggml flash_attn |
-|---------|-------------|-------------|-----------------|
+| Feature | This chapter | ncnn SDPA family | ggml flash_attn family |
+|---------|-------------|------------------|------------------------|
 | Subgroup reduction | ✓ (subgroupAdd) | ✓ | ✓ |
 | Shared memory K/V tile | ✗ (direct global read) | ✓ (local mem) | ✓ |
-| Online softmax | ✓ | ✓ | ✓ |
-| CM acceleration | ✗ | ✓ (KHR+NV) | ✓ (KHR+NV+CM2) |
-| Split-K | ✗ | ✗ | ✓ |
-| KV cache support | ✗ | ✓ | ✓ |
+| Online softmax | ✓ | ✓ (fp32 accumulation) | ✓ |
+| CM acceleration | ✗ | ✓ (`sdpa_fa_cm.comp`) | ✓ (CM1 + CM2) |
+| Split-K | ✗ | ✗ | ✓ (`split_k_reduce.comp`) |
+| KV cache support | ✗ | ✓ (`kvcache_append/copy.comp`) | ✓ (two-phase decode) |
+| Cross-attention | ✗ | ✓ (`sdpa_cross*.comp`) | ✓ (mtmd path) |
+| In-place quantized K/V unpack | ✗ | ✗ | ✓ (`flash_attn_dequant.glsl`) |
+
+> Exercise #3 ("implement a KV cache version") **now has a runnable reference implementation, see 17.8**; comparing with `sdpa_kvcache_append.comp` and `flash_attn_decode_phase_*.comp` shows the production approach: split prefill and decode into distinct kernels instead of making one fused kernel handle both.
 
 ---
 
@@ -254,5 +269,44 @@ ggml's FlashAttention implementation uses a complete tiling strategy combined wi
 - Subgroup operations (`subgroupAdd`) enable efficient warp-level dot product reduction
 - This chapter's implementation is a simplified Br=1 version; real industrial implementations support multi-query row tiling, cooperative matrix acceleration, causal masks, and other extensions
 - Industrial implementations (ncnn, ggml) extend FlashAttention with CM acceleration, Split-K, KV cache, and other features
+
+---
+
+## 17.8 Advanced: KV Cache Incremental Decode and Two-Phase Decode
+
+`ch17_kvcache` (`main_kvcache.cpp` + 3 new shaders) is the runnable reference implementation of the "implement a KV cache version" exercise, and the code added after syncing the four reference repositories. It is a separate executable target and does not touch `main.cpp`, so the existing ch00–ch20 verification results are unaffected.
+
+The main program's `flash_attn.comp` follows a **prefill design**: one workgroup per query row, serially scanning the whole sequence. During real LLM decoding each step produces only one new query but must read a growing KV cache, so production engines split decode into different kernels:
+
+| Stage | Shader | Role | Industrial counterpart |
+|-------|--------|------|------------------------|
+| append | `kvcache_append.comp` | Write the new token's K/V at the end of the cache; no reshuffle | ncnn `sdpa_kvcache_append.comp` / `sdpa_kvcache_copy.comp` |
+| split | `flash_attn_decode_phase1.comp` | Split the cache into tiles of 32 across workgroups; each computes a local online-softmax state `(m_i, l_i, o_i)` | ggml `flash_attn_decode_phase_1.comp` |
+| reduce | `flash_attn_decode_phase2.comp` | Global reduction producing the final output | ggml `flash_attn_decode_phase_2.comp` / `flash_attn_split_k_reduce.comp` |
+
+### Key formula
+
+The local states from phase1 are **unnormalized**: `o_i = Σ exp(score − m_i)·V`, `l_i = Σ exp(score − m_i)`. Phase2 merges them with the same rescaling used by online softmax:
+
+```
+m = max_i m_i
+O = Σ_i exp(m_i − m) · o_i
+L = Σ_i exp(m_i − m) · l_i
+final = O / L
+```
+
+This is FlashAttention's split-K reduction: replacing "one workgroup scans everything" with "many workgroups handle tiles + one reduction" raises parallelism from 1 to `ceil(seqLen / tileSize)` for long contexts.
+
+### Verification
+
+The demo uses `d=64`, a 256-token prefill and 4 decode steps (seqLen 257→260). Each step runs both the two-phase path and a **single-kernel baseline** (reusing this chapter's `flash_attn.spv` with only 1 query workgroup), and performs four checks: cache append contents, two-phase vs CPU reference, single-kernel vs CPU reference, and two-phase vs single-kernel cross-validation. All 4 steps report **0 errors**.
+
+> The demo makes **no speedup claim**: for short sequences the extra dispatch and global reduction can be slower; the payoff comes from parallelism at long context lengths. This is why ncnn has dedicated KV cache shaders and ggml splits decode into `phase_1` / `phase_2`.
+
+### Try it
+
+1. Set `PROMPT_LEN` to 1024 — `tiles` grows from 9 to 33 — and compare single-kernel vs two-phase with GPU timestamps
+2. Replace the phase2 reduction with a two-level tree (group-local then global) for longer contexts
+3. Add ring-buffer / sliding-window behaviour once the cache is full
 
 The next chapter (ch18) will explore **Advanced Quantization**—from int8 to Q4_0/Q8_0/K-quant to MXFP4 GPU-side dequantization and fused inference.

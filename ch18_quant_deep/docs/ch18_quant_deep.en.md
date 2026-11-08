@@ -197,32 +197,17 @@ This way, Q4_0 data is read at the global memory level, but only once before bei
 
 ---
 
-## 18.6 Dequantization Function Architecture in ggml
+## 18.6 Dequantization Function Architecture in ggml (as of 2026-11)
 
-In ggml's Vulkan implementation (`ggml-vulkan`), the dequantization function architecture is as follows:
+Current ggml-vulkan splits dequantization into three layers, finer-grained than "one `dequant_funcs` file called from `mul_mm`":
 
-### dequant_funcs.glsl
+| Layer | Location | Role |
+|-------|----------|------|
+| Data layout / quantization | `ggml/src/ggml-quants.c` (the old `iq-quants.c` was merged in), `ggml-cpu/quants.c` | Byte layout of each block, `quantize_row_*` / `dequantize_row_*` |
+| Shared GLSL snippets | `vulkan-shaders/dequant_funcs.glsl`, `dequant_funcs_cm2.glsl`, `dequant_head.glsl` | `#include`-d unpack/dequant helpers; a separate copy for the CM2 path |
+| Standalone dequant kernels | 26 `vulkan-shaders/dequant_<format>.comp` | `dequant_q4_0.comp`, `dequant_q8_0.comp`, `dequant_q*_k.comp`, `dequant_iq*.comp`, `dequant_{mxfp4,nvfp4,q1_0,q2_0,tq1_0,tq2_0}.comp`, etc. |
 
-Each quantization format has a corresponding unpack+dequantize function:
-
-```glsl
-// Q4_0 dequant function signature (illustrative)
-float dequant_q4_0(uint buf[], uint blockIdx, uint elemInBlock);
-
-// Q8_0 dequant function signature (illustrative)
-float dequant_q8_0(uint buf[], uint blockIdx, uint elemInBlock);
-
-// Common interface: mul_mm calls the corresponding dequant function
-// via function pointers / templates
-```
-
-### Usage in mul_mm
-
-`mul_mm` is the matrix multiply core in ggml-vulkan. It:
-
-1. Selects the corresponding dequant function based on the weight quantization type
-2. Calls the dequant function when loading data into shared memory
-3. Shared memory always stores data in float format
+The `mul_mm` family (`mul_mm.comp` / `mul_mm_cm1.comp` / `mul_mm_cm2.comp` / `mul_mmq_cm1.comp`) picks a pipeline by weight type and unpacks weights in place while loading a tile into shared memory / fragment registers, accumulating in float. All 155 `.comp` templates are compiled by `vulkan-shaders-gen` + glslc **at build time**; no prebuilt `.spv` is shipped.
 
 ### Comparison with ggml
 
@@ -230,11 +215,11 @@ float dequant_q8_0(uint buf[], uint blockIdx, uint elemInBlock);
 |--------|-------------------|--------------|
 | Q4_0 block size | 18 bytes (compact) | 20 bytes (aligned) |
 | Shared memory tiling | Yes | Yes (16×16) |
-| Tile size | Configurable | Fixed 16×16 |
-| Multi-format support | Q4_0 ~ Q8_0, K-quant | Q4_0, Q8_0 |
+| Tile size | Shape-specialized pipelines generated at build time | Fixed 16×16 |
+| Multi-format support | 44 `GGML_TYPE_*` (Q4_0~Q8_0, K/I-quants, MXFP4/NVFP4, TQ, Q1_0/Q2_0, F8_E4M3) | Q4_0, Q8_0 |
 | Bias fusion | Optional | Optional (push constant) |
 
-The 20-byte aligned version in this chapter is more efficient on the GPU (avoiding unaligned access), at the cost of 2 bytes per block overhead (~11%). In ggml's compact version, data must be accessed via byte-address calculations, requiring more complex indexing logic.
+The 20-byte aligned version in this chapter is more efficient on the GPU (avoiding unaligned access), at the cost of 2 bytes per block overhead (~11%). In ggml's compact version, data must be accessed via byte-address calculations, requiring more complex indexing logic. Among the new formats, NVFP4 uses an E4M3 scale per 4 blocks while this course's MXFP4 (ch20) uses E8M0 — a ready-made example of "same E2M1, different scale granularity".
 
 ---
 
@@ -321,8 +306,8 @@ ch18_quant_deep/
 
 ### ggml / llama.cpp
 
-- **Quantization formats**: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K ~ Q6_K, IQ4_NL, IQ3_S, and dozens more
-- **Implementation**: `ggml-vulkan`'s `mul_mm` dispatches to the corresponding dequant function based on weight quantization type
+- **Quantization formats**: `GGML_TYPE_COUNT = 44` — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q1_0/Q2_0, Q2_K~Q6_K/Q8_K, the IQ1~IQ4 family, TQ1_0/TQ2_0, MXFP4/NVFP4, F8_E4M3
+- **Implementation**: the `mul_mm*` family picks a pipeline by weight type; shared unpacking snippets live in `dequant_funcs{,_cm2}.glsl`, with 26 standalone `dequant_<format>.comp` kernels; layouts are defined in `ggml-quants.c`
 - **Optimization techniques**:
   - Using `read_first_invocation` or subgroup broadcasts to accelerate scale reads
   - Unpacking and dequantizing in shared memory to reduce global memory access

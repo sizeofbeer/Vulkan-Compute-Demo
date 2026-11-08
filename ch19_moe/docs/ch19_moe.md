@@ -157,35 +157,40 @@ for each token t, each hidden dim d:
 
 ---
 
-## 19.6 与 ncnn-MoE-Runtime 的 ExpertDispatcher 对比
+## 19.6 与 ncnn-MoE-Runtime 现行架构对比（2026-11 同步）
 
-**ncnn-MoE-Runtime** 的 `ExpertDispatcher` 组件实现了类似的 MoE 路由机制：
+> 首版课程引用的 `ExpertDispatcher` 已在 v0.1.0 的架构清理中**移除**。`63745f1`（2026-11-07）把路由、专家取用、组合拆成 `graph / engine / backends / storage` 四层，并把「模型包」编译成**不可变执行图**，Expert 权重外置于 dense working set。
 
-| 特性 | 本章实现 | ncnn ExpertDispatcher |
-|------|---------|----------------------|
-| 路由算法 | Softmax + top-k | Softmax + top-k |
-| 专家 GEMM | 分块 tiled GEMM | 分块 GEMM + 融合激活 |
-| Token 分发 | 全量计算 + combine 筛选 | Gather → 计算 → Scatter |
-| 负载均衡 | 分析工具 | 专家容量控制 |
-| Push constant | 传递 expert_id | 传递 expert 元数据 |
+| 特性 | 本章实现 | ncnn-MoE-Runtime（`63745f1`） |
+|------|---------|------------------------------|
+| 执行图 | 三个 shader 顺序提交 | 模型包 → 不可变执行图；多 Session 共享权重 |
+| 路由 | `router.comp`：softmax + top-k | `src/graph/router.h::forward_router()` → `ExpertDispatchPlan`；Vulkan 侧 `backends/ncnn/router_vulkan.h`；shader `router_select.comp` / `router_select_raw.comp` |
+| 专家计算 | 8 个专家全量 GEMM | `src/engine/expert.h::prepare_experts()/request_experts()/forward_moe()`；`expert_gather.comp` 只取被选中的 token；`expertbank_{gate_up,down,combine}.comp` 承担专家投影 |
+| 组合 | `combine.comp` 加权求和 | `backends/ncnn/moecombine_vulkan.h::MoeCombine_vulkan`；`moe_combine.comp` / `moe_combine_single_row.comp`；另有 `route_aggregation` |
+| 缓存 / 均衡 | 打印负载分布 | ARC + `ExpertVictimCache` + `ExpertResidencyCoordinator`（`src/storage/`）；原「专家容量控制」改为 **cache lease 限额** + GPU resident bank / 异步 IO |
+| 调度 | 单 Session、单设备 | `BatchScheduler`（多 Session 微批 / DSpark 投机解码）、`HybridMode = Auto / CPU / Hybrid`（`include/ncnn/moe/option.h`） |
+| 权重格式 | FP32 教学权重 | BF16 / FP8 E4M3 / INT4 / INT8 / MXFP4 / Q2_K~Q8_K / Q4_0 / IQ4；Safetensors 目录或 GGUF 文件 |
+| 模型 | 随机权重 | Qwen3 dense、Qwen3.5/3.6 dense+MoE、Qwen3.8-Flash-Next、GPT-OSS、DeepSeek-V4、Phi-mini-MoE、Ling-3.0-tiny（8 类） |
 
-ncnn 的实现更注重实际部署效率，使用了 gather/scatter 模式来避免不必要的计算。本章的实现更侧重于教学——清晰地分离 Router → Expert → Combine 三个阶段。
+`src/kernels/vulkan/` 现在共 **60 个 `.comp`**（其中没有 `gemm*.comp`，专家投影改用 `projection_matvec`、`bfloat16_cooperative_projection`、`qnk_projection`、`float8_projection`），MXFP4 有五件专用 kernel（`gate_up / indexed / projection / route_aggregation / row_tile`）。本章「全量计算 + combine 筛选」仍是教学版；生产路径是 `router_select` → `expert_gather` → ExpertBank → `moe_combine` 的稀疏链路，靠缓存 lease 而非静态专家容量做均衡。
+
+> 做本章练习 #3「实现 Gather/Scatter」时，可直接对照 `expert_gather.comp` 与 `moe_combine.comp`。
 
 ---
 
-## 19.7 与 ggml 的 MUL_MAT_ID 对比
+## 19.7 与 ggml 的 MoE 内核对比
 
-**ggml** 的 `MUL_MAT_ID` 操作专门用于 MoE 的稀疏矩阵乘法：
+`MUL_MAT_ID` 仍是 ggml 的 MoE 算子，但 Vulkan 后端入口现在明确为 `ggml/src/ggml-vulkan/ggml-vulkan.cpp::ggml_vk_mul_mat_id()`（声明在 `ggml-vulkan-common.h`），配套 `mul_mm_id_funcs.glsl`；路由侧新增 `topk_moe.comp` 与 `count_experts.comp`，不再只靠一张 id 矩阵。
 
-| 特性 | 本章实现 | ggml MUL_MAT_ID |
-|------|---------|-----------------|
-| 路由方式 | 显式 Router shader | 通过 id 矩阵隐式选择 |
-| 专家权重存储 | 连续 buffer，expert_id 索引 | 独立的权重矩阵列表 |
-| 计算模式 | 每个专家独立 dispatch | 单个操作内处理所有专家 |
-| 稀疏性 | 始终计算所有专家 | 只计算被选中的专家 |
-| 适用场景 | 教学演示 | 生产推理引擎 |
+| 特性 | 本章实现 | ggml-vulkan（当前） |
+|------|---------|---------------------|
+| 路由方式 | 显式 Router shader | `topk_moe.comp` 选专家 + `count_experts.comp` 统计每专家 token 数，再进 `MUL_MAT_ID` |
+| 专家权重存储 | 连续 buffer，expert_id 索引 | 按 id 索引的专家权重视图，配合 `mul_mm_id_funcs.glsl` 解包 |
+| 计算模式 | 每个专家独立 dispatch | 单个 `ggml_vk_mul_mat_id()` 内按专家分批（`ggml_vk_mul_mat_id_q_f16` / `max_tiles` 预估显存） |
+| 稀疏性 | 始终计算所有专家 | 只计算被选中专家的 token 行 |
+| 相邻能力 | 无 | `flash_attn_decode_phase_*`、`split_k_reduce`、`sparse_compact` 与 FA 融合；新增 WebGPU 后端 |
 
-`MUL_MAT_ID` 的核心思路是将"为每个 token 选择不同的专家权重矩阵"建模为 GPU 友好的索引操作，避免了显式的 gather/scatter 步骤。
+核心思路未变：把「每个 token 选不同专家权重」建模成 GPU 友好的索引/分批操作；变化是**路由与计数已融合成独立 kernel**，并与显存预估、decode 路径协同。
 
 ---
 
@@ -193,12 +198,17 @@ ncnn 的实现更注重实际部署效率，使用了 gather/scatter 模式来�
 
 ```
 ch19_moe/
-├── CMakeLists.txt
-├── main.cpp                    # 主程序：Router → Expert → Combine
+├── CMakeLists.txt              # 两个可执行目标：ch19_moe / ch19_moe_sparse
+├── main.cpp                    # 主程序：dense Router → Expert → Combine
+├── main_sparse.cpp             # 进阶 demo：稀疏 Gather / Scatter（见 19.11）
 ├── shaders/
-│   ├── router.comp             # 路由着色器：Softmax + top-k
-│   ├── expert_gemm.comp        # 专家 GEMM 着色器
-│   └── combine.comp            # 组合着色器：加权求和
+│   ├── router.comp             # 路由着色器：Softmax + top-k（两个目标共用）
+│   ├── expert_gemm.comp        # dense 专家 GEMM 着色器
+│   ├── combine.comp            # dense 组合着色器：加权求和
+│   ├── count_experts.comp      # 稀疏：专家计数 + prefix sum
+│   ├── expert_gather.comp      # 稀疏：scatter 到紧凑槽位 + 反查表
+│   ├── expert_gemm_sparse.comp # 稀疏：只算被选中的 (token, expert) 对
+│   └── moe_combine_sparse.comp # 稀疏：按反查表 gather 加权和
 └── docs/
     ├── ch19_moe.md             # 中文文档
     └── ch19_moe.en.md          # 英文文档
@@ -209,16 +219,17 @@ ch19_moe/
 ## 19.9 运行
 
 ```bash
-# 构建
-cd build
-cmake ..
-make ch19_moe
+# 在仓库根目录
+cmake -B build -G Ninja
+cmake --build build                                 # 全量构建（含 24 个可执行目标）
 
-# 运行
-./ch19_moe
+# 主程序（dense 教学版）
+./build/ch19_moe/ch19_moe
+./build/ch19_moe/ch19_moe --lang en
 
-# 英文模式
-./ch19_moe --lang en
+# 进阶 demo（稀疏 Gather / Scatter，见 19.11）
+./build/ch19_moe/ch19_moe_sparse
+./build/ch19_moe/ch19_moe_sparse --lang en
 ```
 
 ### 预期输出
@@ -262,8 +273,57 @@ make ch19_moe
 
 1. **修改 top_k**：将 `TOP_K` 改为 1 或 3，观察路由结果和负载分布的变化
 2. **增加专家数量**：将 `NUM_EXPERTS` 改为 16 或 32，观察 Router 性能变化
-3. **实现 Gather/Scatter**：在 main.cpp 中实现真正的 expert dispatch（gather → 计算 → scatter），减少不必要的计算
+3. **实现 Gather/Scatter**：实现真正的 expert dispatch（gather → 计算 → scatter），减少不必要的计算 —— **已有可运行参考实现，见 19.11 与 `main_sparse.cpp`**
 4. **添加辅助损失**：在 CPU 参考中实现负载均衡辅助损失计算
 5. **融合 Router**：将 Router 的 logits 计算（`x · W_router`）合并到 Router 着色器中
 6. **对比不同 top-k 选择算法**：实现基于排序的 top-k 选择，与本章的迭代最大值选择对比性能
+
+---
+
+## 19.11 进阶实现：稀疏 Gather / Scatter MoE
+
+`ch19_moe_sparse` 是练习 #3 的可运行参考实现，也是**本次同步四个参考仓库后新增的代码**：它把主程序「所有专家 × 所有 token 全量计算、combine 时再筛掉 3/4」换成现行工业引擎实际使用的稀疏链路。它是独立可执行目标，不改动 `main.cpp`，因此不影响 ch00~ch20 的既有验证结论。
+
+```
+router.spv → count_experts.spv → expert_gather.spv → expert_gemm_sparse.spv → moe_combine_sparse.spv
+```
+
+### 数据流
+
+| 阶段 | Shader | 输出 | 对应工业实现 |
+|------|--------|------|--------------|
+| 路由 | `router.comp`（复用主程序） | `indices[E]` / `weights[E]`，E = `num_tokens × top_k` = 64 | `router_select.comp`、`topk_moe.comp` |
+| 计数 + prefix sum | `count_experts.comp` | `counts[e]`、`offsets[e]`、初值游标 `cursor[e]` | `count_experts.comp`、`ExpertDispatchPlan` |
+| Scatter | `expert_gather.comp` | `gather_token[slot]`、`gather_expert[slot]`、反查表 `gather_slot[entry]` | `expert_gather.comp` |
+| 稀疏 GEMM | `expert_gemm_sparse.comp` | `partial[slot, d]`，只算被选中的 64 行 | `expertbank_gate_up.comp`、`ggml_vk_mul_mat_id()` |
+| 反查组合 | `moe_combine_sparse.comp` | `final_out[t, d]` | `moe_combine.comp` / `moe_combine_single_row.comp` |
+
+- `count_experts.comp` 在**单个 workgroup** 内用 shared atomic 计数，由 lane 0 做串行 prefix sum（专家数只有 8），避免跨 workgroup 的全局同步。专家 e 占用连续槽位 `[offsets[e], offsets[e] + counts[e])`。
+- `expert_gather.comp` 用 `atomicAdd(cursor[e], 1)` 把每个路由条目放进该专家区间，同时写反查表。槽位分配顺序由硬件决定，但**不影响正确性**：combine 只依赖 `gather_slot`，不依赖顺序。
+- `expert_gemm_sparse.comp` 把 token 激活行放进 shared memory 复用。如果每个线程各自从全局内存重读整行，稀疏版反而会被访存拖慢（实测加速比接近 1×）——这正是工业实现在 gather 之后必须接 tiled / coopmat GEMM 的原因。
+- `moe_combine_sparse.comp` 用反查表取结果，不必物化 `[num_experts][num_tokens][dim]` 的稠密专家输出。
+
+### 验证与实测
+
+程序使用与主程序相同的随机种子与维度，`dense` CPU 参考作为 golden，做三组检查：
+
+1. `counts` / `offsets` / gather 结束后的 `cursor`（应等于 `offsets[e] + counts[e]`）与 CPU prefix sum 一致，槽位总数 = 64；
+2. 每个 `(token, k)` 恰好占一个槽位：槽位唯一、落在对应专家区间、`gather_token` / `gather_expert` 与路由一致；
+3. 最终输出对比 dense CPU golden：`错误数=0，最大误差≈9.5e-7，RMSE≈1.8e-7`。
+
+| 指标 | dense 主程序 | sparse 进阶 demo |
+|------|--------------|------------------|
+| 专家 GEMM 行数 | `8 × 32 = 256` | `32 × 2 = 64` |
+| MAC | 1,048,576 | 262,144 |
+| 理论节省 | — | **4×**（= `num_experts / top_k`） |
+| GTX 1080 Ti 实测 | 8 次 dispatch | 1 次 dispatch，约 **1.9~3.2×** |
+
+实测低于理论上界是**正常且值得理解**的：教学规模（32 token × 64 维）太小，workgroup 调度、权重访存和 `count` / `gather` 两次额外 dispatch 都在摊薄收益；测量还会随 GPU 频率与缓存状态波动。把 `NUM_EXPERTS` 调大、`TOP_K` 调小、放大 `HIDDEN_DIM`，或把稀疏 GEMM 换成 ch04 的 16×16 tiling / ch15 的 coopmat，才会逐步逼近上界。这也解释了 ncnn-MoE-Runtime 为何用 ExpertBank + 缓存 lease、ggml 为何用 `max_tiles` 预估显存来**批量化**专家计算：稀疏化的收益要靠「把每个专家的 token 攒够」才能兑现。
+
+### 动手
+
+1. 把 `TOP_K` 改成 1，理论上界变为 8×，观察实测加速比是否同步变化
+2. 把 `NUM_EXPERTS` 改成 16（注意 `router.comp` 的 64 线程上限与 `count_experts.comp` 的 `s_counts[64]` 上限），观察负载分布与加速比
+3. 把稀疏 GEMM 换成 ch04 的 tiled 版本或 ch15 的 coopmat 版本，对比加速比
+4. 把 prefix sum 换成多 workgroup 的 GPU scan（本 demo 因专家数只有 8，用单 workgroup 串行 scan）
 7. **专家并行**：修改 main.cpp 使用多个命令缓冲并行执行多个专家 GEMM

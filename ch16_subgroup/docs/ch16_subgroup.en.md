@@ -236,6 +236,7 @@ ncnn's Vulkan backend extensively uses subgroup operations for acceleration:
 - **Winograd convolution**: Subgroup accelerates data movement within tiles
 - **Reduction operators**: `subgroupAdd` replaces shared memory reductions
 - **Softmax**: Warp-level softmax for normalization within attention heads
+- **Synced 2026-11**: `shader/reduction.comp` now uses `shared float sdata[256]` with `init_acc()/element_accum()` for **fp32 accumulation** plus subgroup arithmetic; Vulkan paths of `rmsnorm` / `layernorm` / `groupnorm` / `instancenorm` were progressively moved to subgroup reductions (#6754 / #6755 / #7135 / #7136 / #7247). This confirms this chapter's "subgroup replaces shared-memory reduction" — with the caveat that **accumulation precision still matters**.
 
 ### Subgroup Usage in ggml (llama.cpp)
 

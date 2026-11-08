@@ -42,6 +42,7 @@ The intermediate score matrices `S` and `P` are `N×N`. When the sequence length
   - NVIDIA-specific **coopmat2** path.
   The common goal is "do not write the N×N score matrix back to memory". The 3-kernel version in this chapter is exactly the "naive attention" that does not perform this optimization, for ease of understanding.
 - **ncnn**: attention in CV models (e.g., ViT, MobileViT) is also split into matmul+softmax+matmul, and fused as much as possible.
+- **Synced 2026-11**: production FlashAttention is no longer "one `flash_attn.comp`". ncnn's `shader/` has `sdpa_fa.comp` / `sdpa_fa_cm.comp` / `sdpa_cross*.comp` / `sdpa_kvcache_{append,copy}.comp`; ggml's `vulkan-shaders/` has `flash_attn{,_cm1,_cm2}.comp`, `flash_attn_decode_phase_{1,2}.comp`, `flash_attn_split_k_reduce.comp` and `flash_attn_sparse_compact.comp`. Splitting prefill and decode into distinct kernels is now the mainstream design; see ch17.
 
 ## 8.6 FlashAttention Fused Kernel
 

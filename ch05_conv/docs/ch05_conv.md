@@ -75,11 +75,12 @@ main 中按 filter_transform → input_transform → gemm → output_transform �
 
 ### 对照 ncnn
 
-ncnn 的 Winograd 实现（`convolution_winograd.cpp`）做了更极致的优化：
+ncnn 的 Winograd 实现（层代码 `src/layer/vulkan/convolution_vulkan.cpp`，着色器 `src/layer/vulkan/shader/convolution_*winograd*.comp`；首版写的 `convolution_winograd.cpp` 并不存在）做了更极致的优化：
 - **NC4HW4 打包**：4 通道一组打包成 `vec4`，一次 SIMD 算 4 通道
 - **多 tile 合并**：多个 4×4 tile 合并成一次大矩阵乘，提高计算密度
 - **F(6×6, 3×3)**：更大的 tile 能进一步减少乘法（但数值稳定性要求更高）
 - **融合输出变换**：输出变换与偏置加 / 激活函数融合，减少显存带宽
+- **int8 / coopmat 变体（2026-11 新增）**：`convolution_3x3s1d1_winograd{23,43}_transform_input_int8_cm.comp`、`convolution_winograd_gemm_cm.comp`、`convolution_gemm_int8_cm.comp`、`convolution1d_*_cm.comp`（详见 ch15）
 
 本章的实现在教学上等价于「单通道单 tile 版」，不涉及打包 / 融合 / 多 tile 合并，但核心数学一致。
 

@@ -43,9 +43,26 @@ g.end();                                         // 一次性 submit + 等 fence
 2. 在图里加一个**无依赖**的算子（如同时对 T1 另算一个统计量），思考它能不能和 matmul 并行（需要双队列，进阶）。
 3. 把本图的 barrier 删掉再跑，开着 Validation Layers，观察它报出「写后读 hazard」——亲手体验为何 barrier 必要。
 
-## 12.6 对照工业级
+## 12.6 对照工业级（2026-11 同步）
 
-- **ncnn**：模型被展开成 `layer` 链表，前向时逐层 `VkCompute::submit_and_wait`；后续版本引入「录制命令、批量提交」以减少开销，并自动在层间插入 barrier。
-- **llama.cpp / ggml-vulkan**：`ggml_graph_compute` 先把整图录制进命令缓冲（含自动依赖 barrier），一次性提交；并区分 compute / transfer 队列让权重搬运与计算重叠。
+- **ncnn**：`VkCompute::record_pipeline()` 把 pipeline + 描述符 + push constant + dispatch 录进 `delayed_records`，`submit_and_wait()` 一次性提交并按依赖插入 barrier；`pending_dispatch_total()` 暴露待提交 dispatch 总数。**不是「逐层 submit」**——现行版本从一开始就是「延迟录制 + 批提交」。
+- **llama.cpp / ggml-vulkan**：入口已改名为 `ggml_backend_vk_graph_compute()`（`ggml-vulkan.cpp`，注册在 backend 的 `.graph_compute` 函数指针），整图录进命令缓冲、按依赖自动插 barrier、区分 compute / transfer 队列。设备与管线结构收敛到 `ggml-vulkan-types.h` 的 `vk_device_struct` / `vk_pipeline_struct`；旧文档中的 `vk-device.cpp`、`pipeline.cpp`、`ggml_vk::graph_compute` 均已不存在。
+- **ncnn-compiler（本次新增参考）**：把「图执行」推到编译期——AOT 生成模型专用 `.so`，运行时不再解析 plan、也不解释 kernel schedule（见 12.7）。
+
+## 12.7 进阶：从「运行时录图」到「AOT 固定图」
+
+`ncnn-compiler`（`867c6ab`）的 `--backend=vulkan` 产品可以当作本章 `Graph` 的工业级终点：它把 ncnn `.param/.bin` 经 ncnn 方言 → TOSA → Linalg → GPU dialect 降级为 SPIR-V，再生成**模型专用 fixed-run 宿主 C++**（`tools/VulkanLifecycleCodegen.cpp`、`lib/Support/VulkanHostProgram.cpp`）。
+
+| 维度 | 本章 `Graph` | ncnn-compiler fixed-run |
+|------|--------------|-------------------------|
+| 图来源 | 运行时由 C++ 代码逐个 `node()` 搭建 | 编译期静态 FP32 图，运行时不解析 plan |
+| `create` | 上传权重、建管线 | 生成的代码完成权重上传 / flush / transfer barrier / copy / fence |
+| `run` | 每次录制命令缓冲 | 每次 run **重置并重录**：输入 staging → barrier → pipeline/descriptor/push constant/dispatch → 输出回读 / invalidate / fence |
+| 同步 | 手写「写后读」barrier | 静态三段屏障：host→transfer→compute、compute 写→读/写、compute→transfer→host |
+| 形状 | 固定 | 固定；**明确拒绝动态 shape** |
+| 产物 | 可执行文件 | `<model>_vulkan.h` + `.json` + `lib<model>_vulkan.so` + `.plan.json`；SPIR-V/权重内嵌，无 LLVM/plan 运行时依赖 |
+| 验收 | 手动跑一遍 | 四 profile 门禁：release（双 ICD）/ sanitize（ASan+UBSan）/ offline（无设备）/ software（仅 llvmpipe）；`run_gate.py` 另有 `hardware` 变体 |
+
+> 注意它**不调用** `ncnn::VkCompute` / `VkAllocator` / `PipelineCache`，而是用原生 Vulkan API 生成宿主代码（`lib/VulkanDeviceHelper/VulkanDeviceHelper.cpp`）。这条路线与本章互补：本章教你「图为什么能一次提交」，AOT 告诉你「当图完全静态时，连调度器本身都可以删掉」。读 `docs/ncnn-vulkan-backend-contract.md` 可与本章 12.2~12.4 逐条对照。
 
 下一章（ch13）是**综合项目**：用前面所有积木（常驻权重 + matmul + 激活 + 图执行）跑通一个小模型的前向推理，把课程目标真正落地。

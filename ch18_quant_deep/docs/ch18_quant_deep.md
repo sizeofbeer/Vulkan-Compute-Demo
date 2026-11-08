@@ -197,31 +197,17 @@ block 1: scale₁ = max|w₃₂...w₆₃| / 7
 
 ---
 
-## 18.6 ggml 中的反量化函数架构
+## 18.6 ggml 中的反量化函数架构（2026-11 现状）
 
-ggml 的 Vulkan 实现（`ggml-vulkan`）中，反量化函数的架构如下：
+现行 ggml-vulkan 把反量化拆成三层，比「一个 `dequant_funcs` 文件 + `mul_mm` 里函数调用」更细：
 
-### dequant_funcs.glsl
+| 层 | 位置 | 作用 |
+|----|------|------|
+| 数据结构 / 量化算法 | `ggml/src/ggml-quants.c`（旧的 `iq-quants.c` 已并入）、`ggml-cpu/quants.c` | 定义每种 block 的字节布局、`quantize_row_*` / `dequantize_row_*` |
+| GLSL 公共片段 | `vulkan-shaders/dequant_funcs.glsl`、`dequant_funcs_cm2.glsl`、`dequant_head.glsl` | 被各 kernel `#include` 的解包/反量化函数；CM2 路径单独一份 |
+| 独立反量化 kernel | `vulkan-shaders/dequant_<format>.comp`（26 个） | `dequant_q4_0.comp`、`dequant_q8_0.comp`、`dequant_q*_k.comp`、`dequant_iq*.comp`、`dequant_{mxfp4,nvfp4,q1_0,q2_0,tq1_0,tq2_0}.comp` 等 |
 
-每种量化格式对应一个解包+反量化函数：
-
-```glsl
-// Q4_0 反量化函数签名（示意）
-float dequant_q4_0(uint buf[], uint blockIdx, uint elemInBlock);
-
-// Q8_0 反量化函数签名（示意）
-float dequant_q8_0(uint buf[], uint blockIdx, uint elemInBlock);
-
-// 通用接口：mul_mm 通过函数指针/模板调用对应的反量化函数
-```
-
-### 在 mul_mm 中的使用
-
-`mul_mm` 是 ggml-vulkan 中的矩阵乘核心，它：
-
-1. 根据权重量化类型选择对应的反量化函数
-2. 在加载数据到共享内存时调用反量化函数
-3. 共享内存中始终以 float 格式存储
+`mul_mm` 系列（`mul_mm.comp` / `mul_mm_cm1.comp` / `mul_mm_cm2.comp` / `mul_mmq_cm1.comp`）按权重量化类型选择 pipeline，并在加载权重 tile 时就地解包到共享内存 / 片段寄存器，共享内存中始终以 float 累加。155 个 `.comp` 模板由 `vulkan-shaders-gen` 在**构建期**用 glslc 编成 SPIR-V，仓库中没有预编译 `.spv`。
 
 ### 本章与 ggml 的对比
 
@@ -229,11 +215,11 @@ float dequant_q8_0(uint buf[], uint blockIdx, uint elemInBlock);
 |------|-----------|----------|
 | Q4_0 block 大小 | 18 字节（紧凑） | 20 字节（对齐） |
 | 共享内存 tiling | 有 | 有（16×16） |
-| Tile 尺寸 | 可配置 | 固定 16×16 |
-| 多格式支持 | Q4_0 ~ Q8_0, K-quant | Q4_0, Q8_0 |
+| Tile 尺寸 | 构建期按 shape 生成多套 | 固定 16×16 |
+| 多格式支持 | 44 种 `GGML_TYPE_*`（Q4_0~Q8_0、K-quant、I-quant、MXFP4/NVFP4、TQ、Q1_0/Q2_0、F8_E4M3） | Q4_0, Q8_0 |
 | 偏置融合 | 可选 | 可选（push constant 控制） |
 
-本章的 20 字节对齐版在 GPU 上更高效（避免非对齐访问），代价是每 block 2 字节的额外开销（约 11%）。在 ggml 的紧凑版中，需要通过字节地址计算来访问数据，这需要更复杂的索引逻辑。
+本章的 20 字节对齐版在 GPU 上更高效（避免非对齐访问），代价是每 block 2 字节的额外开销（约 11%）。在 ggml 的紧凑版中，需要通过字节地址计算来访问数据，这需要更复杂的索引逻辑。新增格式里，NVFP4 用 E4M3 scale（4 blocks 一组），而本章 ch20 的 MXFP4 用 E8M0 scale——这是「同为 E2M1 但缩放粒度不同」的现成对比例子。
 
 ---
 
@@ -320,8 +306,8 @@ ch18_quant_deep/
 
 ### ggml / llama.cpp
 
-- **量化格式**：Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K ~ Q6_K, IQ4_NL, IQ3_S 等数十种
-- **实现方式**：`ggml-vulkan` 中的 `mul_mm` 根据权重量化类型分发到对应的反量化函数
+- **量化格式**：`GGML_TYPE_COUNT = 44`——Q4_0/Q4_1/Q5_0/Q5_1/Q8_0、Q1_0/Q2_0、Q2_K~Q6_K/Q8_K、IQ1~IQ4 系列、TQ1_0/TQ2_0、MXFP4/NVFP4、F8_E4M3
+- **实现方式**：`ggml-vulkan` 中 `mul_mm*` 系列按权重类型选 pipeline；公共解包片段在 `dequant_funcs{,_cm2}.glsl`，另有 26 个 `dequant_<format>.comp` 独立 kernel；结构定义见 `ggml-quants.c`
 - **优化技巧**：
   - 使用 `read_first_invocation` 或 subgroup 广播来加速 scale 读取
   - 在共享内存中解包和反量化，减少全局内存访问

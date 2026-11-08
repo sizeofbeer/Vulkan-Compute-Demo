@@ -1,0 +1,52 @@
+#version 450
+// Decode 阶段 2（reduce）：合并 phase1 各 tile 的局部 online-softmax 状态。
+//
+//   m_global = max_i m_i
+//   O        = Σ_i exp(m_i - m_global) · o_i
+//   L        = Σ_i exp(m_i - m_global) · l_i
+//   final    = O / L
+//
+// 这就是 FlashAttention 的 split-K 归约公式（与 online softmax 的 rescale 同源）。
+// 对应工业实现：ggml `flash_attn_decode_phase_2.comp` / `flash_attn_split_k_reduce.comp`。
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer PartialO { float partO[]; };  // numTiles × d
+layout(std430, binding = 1) readonly buffer PartialM { float partM[]; };  // numTiles
+layout(std430, binding = 2) readonly buffer PartialL { float partL[]; };  // numTiles
+layout(std430, binding = 3) writeonly buffer OutBuf  { float O[];     };  // 1 × d
+
+layout(push_constant) uniform PC {
+    uint seqLen;
+    uint d;
+    uint tileSize;
+};
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint numTiles = (seqLen + tileSize - 1u) / tileSize;
+
+    float mGlobal = -1e30f;
+    for (uint t = 0u; t < numTiles; ++t)
+        mGlobal = max(mGlobal, partM[t]);
+
+    uint elemsPerThread = (d + 31u) / 32u;
+    uint colBase = tid * elemsPerThread;
+    float o[4];
+    for (uint i = 0u; i < elemsPerThread; ++i) o[i] = 0.0f;
+
+    float lSum = 0.0f;
+    for (uint t = 0u; t < numTiles; ++t) {
+        float w = exp(partM[t] - mGlobal);
+        lSum += w * partL[t];
+        for (uint i = 0u; i < elemsPerThread; ++i) {
+            uint col = colBase + i;
+            if (col < d) o[i] += w * partO[t * d + col];
+        }
+    }
+
+    for (uint i = 0u; i < elemsPerThread; ++i) {
+        uint col = colBase + i;
+        if (col < d) O[col] = o[i] / max(lSum, 1e-20f);
+    }
+}

@@ -50,7 +50,7 @@ Finally `submit` + `waitForFences`: this is the fence taking effect — it guara
 
 ## 2.5 Compared with industry-grade
 
-- **ncnn**'s `VkCompute` internally maintains `pending_dispatch_total` and `delayed_records`; it **automatically inserts the correct barrier before you record the next operator** — the caller never needs to hand-write `pipelineBarrier`. The "hand-written barrier" in this chapter exists precisely so you understand what ncnn does for you.
+- **ncnn**'s `VkCompute` maintains `delayed_records` and `pending_dispatch_total()`: `record_pipeline()` only records, while `submit_and_wait()` submits once and **inserts dependency barriers automatically** — the caller never hand-writes `pipelineBarrier`. The "hand-written barrier" here exists so you understand what ncnn does for you. (The `VkCompute::dispatch()` name from the first release is not a public API; dispatch only appears as internal `vkCmdDispatch` calls in `command.cpp`.)
 - **llama.cpp** once specifically added a `buffer ownership transfer` barrier on AMD devices (because queue / memory ownership switches require extra synchronization). Synchronization is the easiest pitfall in Vulkan inference, so make sure you fully grasp it here.
 
 The next chapter (ch03) covers **memory management**: why does `vkUpload` go through a staging buffer when device-local? What exactly differs between `HOST_VISIBLE / DEVICE_LOCAL / COHERENT`? And how is FP16 stored into a buffer.

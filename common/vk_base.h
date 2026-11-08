@@ -164,7 +164,7 @@ SpecializationInfo vkMakeSpecializationInfo(const T& values, uint32_t startId = 
 
 // 把「建管线 + 建描述符集 + 绑 buffer + push constant + dispatch」收敛成一个对象，
 // 让后面的算子章节只关心「喂哪些 buffer、压什么常量、dispatch 几组」。
-// 这直接对应 ncnn 的 VkCompute / llama.cpp 的 vk_pipeline_wrapper 思路。
+// 对应 ncnn 的 VkCompute::record_pipeline() / llama.cpp 的 vk_pipeline_struct 思路。
 struct ComputePass {
     VulkanContext* ctx = nullptr;
     vk::ShaderModule        module{};
@@ -220,7 +220,8 @@ struct DeviceArena {
 // ============================================================
 
 // 把多个算子录进一个 command buffer，依赖处插 pipeline barrier（写后读），最后只 submit 一次。
-// 对应 ggml 的计算图录制 / ncnn 的 layer 串行提交。避免每算子一次 submit 的队列开销（ch09 提过）。
+// 对应 ggml 的 ggml_backend_vk_graph_compute() / ncnn 的 VkCompute 延迟录制（delayed_records）。
+// 避免每算子一次 submit 的队列开销（ch09 提过）；ncnn-compiler 更进一步把静态图 AOT 成 fixed-run 宿主代码。
 struct Graph {
     VulkanContext* ctx = nullptr;
     vk::CommandBuffer cmd{};

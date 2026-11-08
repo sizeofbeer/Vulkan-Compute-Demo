@@ -136,6 +136,66 @@ ggml（llama.cpp 使用的底层库）是 K-quant 格式的起源。我们的实
 - **分组策略**：不同粒度（per-tensor, per-row, per-block）
 - **融合运算**：MXFP4 矩阵乘可以直接在硬件上实现
 
+## ggml 量化格式全景（2026-11 同步）
+
+`ggml/include/ggml.h` 现在是 `GGML_TYPE_COUNT = 44`；课程首版写的「20+ 种」以及「前沿 = K-quant + MXFP4」已不完整。按家族分：
+
+| 家族 | 类型 | 备注 |
+|------|------|------|
+| 浮点基准 | F32 / F16 / BF16 / F64 | 未量化 |
+| 整数量化 | I8 / I16 / I32 / I64 | 多作中间格式 |
+| 基础 block | Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1、**Q1_0 / Q2_0** | 新增 1-bit / 2-bit 基础格式 |
+| K-quant | Q2_K ~ Q6_K、Q8_K | 本章主题，仍是主流 |
+| I-quant | IQ2_XXS/XS、IQ3_XXS/S、IQ1_S/M、IQ4_NL/XS | 矢量量化 |
+| 三元 | **TQ1_0 / TQ2_0** | 三值权重 |
+| 微观缩放 FP4 | **MXFP4**（E8M0 scale）/ **NVFP4**（E4M3 scale，4 blocks 一组） | 本章实现 MXFP4 |
+| FP8 | **F8_E4M3** | 与 FP4 混合精度配合使用 |
+
+对应的 Vulkan 反量化内核是 `ggml/src/ggml-vulkan/vulkan-shaders/dequant_<format>.comp`（26 个），公共片段为 `dequant_funcs.glsl` / `dequant_funcs_cm2.glsl`；`llama-quant.cpp` 已提供 `GGML_FTYPE_MOSTLY_{MXFP4,NVFP4,Q1_0,F8_E4M3}` 等整体量化档位。
+
+> **动手（已有参考实现，见下节）**：把本章 MXFP4 的 E8M0/fp16 scale 换成 NVFP4 的 E4M3 scale，对比同样的 E2M1 权重在不同缩放粒度下的误差——这是当前两个 4-bit 工业格式最直接的差异。ncnn-MoE-Runtime 侧也已跟进 BF16 / FP8 E4M3 / INT4 / INT8 / MXFP4 / Qn_K，并有 5 个 MXFP4 专用 kernel（见 ch19）。
+
+## NVFP4：两级 E4M3 缩放（进阶实现）
+
+`ch20_nvfp4`（`main_nvfp4.cpp` + `shaders/nvfp4_gemm.comp`）是上面这道动手题的可运行参考实现，也是本次同步四个参考仓库后新增的代码。它是独立可执行目标，不改动 `main.cpp`。
+
+| 格式 | 值 | scale 粒度 | scale 格式 | 本教学布局 | 比特率 |
+|------|----|-----------|-----------|-----------|--------|
+| MXFP4（OCP 简化版） | E2M1 | 32 元素 | 1 个 fp16 | 20 字节 / 32 元素 | 5 bpe |
+| NVFP4（本 demo） | E2M1 | 16 元素 + 64 元素共享全局 | 4 个 E4M3 + 1 个 fp16 | 40 字节 / 64 元素 | 5 bpe |
+
+两者**比特率相同**，因此对比能隔离出「缩放粒度 + scale 精度」的影响，而不掺入压缩比差异。
+
+### 数据布局（super-block，40 字节 = 10 × uint32）
+
+```
+字节 0..1  : fp16 global scale
+字节 2..5  : 4 × uint8 E4M3 micro-block scale
+字节 6..7  : padding（对齐）
+字节 8..39 : 64 × 4-bit E2M1 值（2 值/字节）
+```
+
+- 反量化：`w = E2M1_decode(code) × E4M3_decode(scale[micro]) × global`。
+- 量化：先按 64 元素 super-block 取 `global = maxAbs / 448`（E4M3 上限），再对每个 16 元素 micro-block 取 `scale = maxAbs / (6 × global)` 并编码成 E4M3（E2M1 上限 6）。
+- CPU 侧一律用**实际存储后的** fp16 / E4M3 值做反量化，保证与 GPU shader 逐位一致——这是融合反量化 kernel 验证能通过的关键。
+
+### 实测（M=256, K=512, N=256，GTX 1080 Ti）
+
+| 指标 | MXFP4 | NVFP4 |
+|------|-------|-------|
+| 存储 | 81,920 字节 / 5.00 bpe | 81,920 字节 / 5.00 bpe |
+| 权重量化 RMSE | 0.06139 | **0.05806** |
+| GEMM 输出 RMSE（vs FP32） | 0.79804 | **0.75860** |
+| GPU 融合 GEMM vs CPU 参考 | 0 错误，RMSE 1.46e-6 | 0 错误，RMSE 1.46e-6 |
+
+NVFP4 略优（约 5%），但提升**并不巨大**：更细的 16 元素粒度降低了块内动态范围，代价是 E4M3 scale 本身也要量化、两级缩放各自引入误差。真实 Blackwell NVFP4 还会配合校准算法与硬件 FP4 Tensor Core；本 demo 只展示格式差异。工业实现见 ggml `dequant_nvfp4.comp` / `GGML_TYPE_NVFP4` 与 `llama-quant.cpp` 的 `GGML_FTYPE_MOSTLY_NVFP4`。
+
+### 动手
+
+1. 把 micro-block 从 16 改成 8（scale 数翻倍、布局要重排），观察 RMSE 与比特率的变化
+2. 把 E4M3 换成 E5M2，对比 scale 动态范围与精度
+3. 给两种格式都加上 per-channel 全局 scale，观察长尾权重的误差
+
 ## 量化技术的未来
 
 ### 4-bit 及以下

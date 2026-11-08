@@ -52,7 +52,7 @@ arena.reset();                               // 一帧结束：偏移归零，�
 
 ## 10.6 对照工业级
 
-- **ncnn**：`VkBlobAllocator` 维护一个 16MB 的 device-local 池，blob 分配/回收都在池内；`VkWeightAllocator` 单独存权重并标记常驻；两者都尽量复用，避免把权重搬来搬去。
-- **llama.cpp / ggml-vulkan**：`ggml_arena` 在每次 `ggml_graph_compute` 时一块大 buffer 复用所有临时张量，`ggml_free` 仅回退指针；模型权重（反量化后）常驻 device-local，不在每帧分配。
+- **ncnn**：`VkBlobAllocator` 以 `preferred_block_size`（默认 16MB）维护 device-local 池，`fastMalloc()` 按对齐切块并在池内复用；`VkWeightAllocator`（默认 8MB）单独存权重并常驻；`VkStagingAllocator` 负责 host-visible 中转。另有 `PipelineCache::save_cache()/load_cache()` 可把编译好的管线跨进程持久化。
+- **llama.cpp / ggml-vulkan**：`ggml_backend_vk_graph_compute()`（见 ch12）为整图临时张量复用大 buffer，结构定义在 `ggml-vulkan-types.h`；权重常驻 device-local，不按帧分配。首版提到的 `ggml_arena` / `ggml_free` / `dev->device_vk` 均已不存在。
 
 下一章（ch11）我们在 matmul 里**就地融合反量化**——权重以 int8 存储省 4 倍显存，GPU 读取时当场还原成 float 再累加，这是 LLM 推理省显存的核心手段。

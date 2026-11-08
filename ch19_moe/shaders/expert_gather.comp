@@ -1,0 +1,38 @@
+#version 450
+// ch19_moe/shaders/expert_gather.comp
+// 稀疏 MoE 第 2 步：把路由结果 scatter 成按专家分组的紧凑列表。
+//
+// 对每个路由条目 entry = (token t, 第 k 个专家)：
+//   e    = indices[entry]
+//   slot = atomicAdd(cursor[e], 1)      // 在专家 e 的连续区间里占一个槽位
+//   gather_token[slot]  = t
+//   gather_expert[slot] = e
+//   gather_slot[entry]  = slot          // 反查表，供 combine 阶段 O(1) 取回结果
+//
+// 对应工业实现：ncnn-MoE-Runtime `expert_gather.comp`、ggml `MUL_MAT_ID` 的按专家分批。
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Indices      { uint indices[];       };
+layout(std430, binding = 1) buffer         Cursor        { uint cursor[];        };
+layout(std430, binding = 2) writeonly buffer GatherToken  { uint gather_token[];  };
+layout(std430, binding = 3) writeonly buffer GatherExpert { uint gather_expert[]; };
+layout(std430, binding = 4) writeonly buffer GatherSlot   { uint gather_slot[];   };
+
+layout(push_constant) uniform PC {
+    uint total_entries;
+    uint top_k;
+};
+
+void main() {
+    uint entry = gl_GlobalInvocationID.x;
+    if (entry >= total_entries) return;
+
+    uint e    = indices[entry];
+    uint slot = atomicAdd(cursor[e], 1u);
+
+    uint t = entry / top_k;
+    gather_token[slot]  = t;
+    gather_expert[slot] = e;
+    gather_slot[entry]  = slot;
+}
