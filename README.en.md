@@ -2,6 +2,8 @@
 
 > A hands-on course with paired "code + documentation" that progresses chapter by chapter. Each chapter = an independently compilable and runnable project + an explanatory document.
 > Goal: take you from "not even knowing what Vulkan is" to "being able to build your own ncnn-like / ggml-vulkan-like inference engine".
+>
+> **Starting point**: [AiChiTuDouPian/vulkan-nn](https://github.com/AiChiTuDouPian/vulkan-nn)
 
 ---
 
@@ -136,10 +138,6 @@ Each chapter's `docs/` contains a three-part structure of "concept explanation â
 ---
 
 ## 4. Reference Resources
-
-### Project Origin
-
-The idea for this course started from [**AiChiTuDouPian/vulkan-nn**](https://github.com/AiChiTuDouPian/vulkan-nn) ("Vulkan Neural Network Compute Acceleration Â· From Zero to Mastery Course").
 
 ### Reference Industrial Implementations (re-verified 2026-11-08)
 

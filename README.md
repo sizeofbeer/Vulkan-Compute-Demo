@@ -2,6 +2,8 @@
 
 > 一套「代码 + 文档」配套、逐章递进的实战课程。每一章 = 一个可独立编译运行的工程 + 一份讲解文档。
 > 目标：从「连 Vulkan 是什么都不清楚」带到「能自研一个类 ncnn / 类 ggml-vulkan 的推理引擎」。
+>
+> **想法起点**：[AiChiTuDouPian/vulkan-nn](https://github.com/AiChiTuDouPian/vulkan-nn)
 
 ---
 
@@ -136,10 +138,6 @@ cmake --build build
 ---
 
 ## 4. 参考资源
-
-### 项目起源
-
-本课程的想法起点是 [**AiChiTuDouPian/vulkan-nn**](https://github.com/AiChiTuDouPian/vulkan-nn)（「Vulkan 神经网络计算加速 · 从零到精通课程」）。
 
 ### 参考工业级实现（2026-11-08 重新核对）
 
